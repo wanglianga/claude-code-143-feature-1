@@ -6,10 +6,10 @@ import {
   Alert, Badge, EventTypeTag, Field, Modal, Spinner, StatusBadge,
   fmtDateTime, fmtMoney,
 } from '../components/ui';
+import PositionTransfersTab from './PositionTransfers';
 
 const EVENT_TYPES = [
   { key: 'OVERTIME', label: '临时加班' },
-  { key: 'POSITION_CHANGE', label: '岗位调换' },
   { key: 'EARLY_LEAVE', label: '工人早退' },
   { key: 'EXTRA_CARRY', label: '额外搬运' },
   { key: 'INJURY', label: '工人受伤' },
@@ -61,6 +61,8 @@ export default function TaskRoom() {
   const a = room.assignment;
   const canCheckIn = a.status === 'ACCEPTED';
   const canCheckOut = ['WORKING', 'CHECKED_IN'].includes(a.status);
+  const pendingTransfer = (room.positionTransfers || []).find((t: any) => t.status === 'PENDING');
+  const transferCount = (room.positionTransfers || []).length;
 
   return (
     <div>
@@ -68,6 +70,10 @@ export default function TaskRoom() {
       <div className="fab-space" />
       {error && <Alert kind="error">{error}</Alert>}
       {msg && <Alert kind="ok">{msg}</Alert>}
+
+      {isWorker && pendingTransfer && (
+        <Alert kind="warn">⚠️ 现场主管发起了岗位临时调换（{pendingTransfer.originalPosition} → {pendingTransfer.newPosition}），请前往「岗位调换」页核对强度、风险与工资差异后确认或拒绝；未确认期间从事新岗位的时间将计为争议工时。</Alert>
+      )}
 
       <div className="card">
         <div className="row">
@@ -87,6 +93,9 @@ export default function TaskRoom() {
 
       <div className="tabs">
         <button className={tab === 'overview' ? 'active' : ''} onClick={() => setTab('overview')}>考勤与保险</button>
+        <button className={tab === 'transfers' ? 'active' : ''} onClick={() => setTab('transfers')}>
+          岗位调换{transferCount ? ` (${transferCount})` : ''}{isWorker && pendingTransfer ? ' ⚠️' : ''}
+        </button>
         <button className={tab === 'events' ? 'active' : ''} onClick={() => setTab('events')}>作业事件 ({room.events.length})</button>
         <button className={tab === 'chat' ? 'active' : ''} onClick={() => setTab('chat')}>任务沟通 ({room.messages.length})</button>
         <button className={tab === 'settlement' ? 'active' : ''} onClick={() => setTab('settlement')}>日结结算</button>
@@ -138,6 +147,10 @@ export default function TaskRoom() {
         <EventsTab room={room} isWorker={isWorker} isField={isField} busy={busy} onAct={act} />
       )}
 
+      {tab === 'transfers' && (
+        <PositionTransfersTab room={room} isWorker={isWorker} isField={isField} busy={busy} onAct={act} />
+      )}
+
       {tab === 'chat' && <ChatTab room={room} onSent={load} />}
 
       {tab === 'settlement' && (
@@ -161,13 +174,25 @@ function InsuranceCard({ room }: { room: any }) {
         <div className="grid grid-2" style={{ marginTop: 10 }}>
           <div className="kv">
             <span className="k">产品</span><span>{p.insurerProduct}</span>
-            <span className="k">保额</span><span>{p.coverageWan} 万元</span>
+            <span className="k">承保岗位</span>
+            <span>
+              {p.currentPosition ? <b>{p.currentPosition}</b> : room.job.title}
+              {p.originalPosition && p.currentPosition && (
+                <span className="small muted">（原：{p.originalPosition}，已随岗位调换更新）</span>
+              )}
+            </span>
+            <span className="k">保额</span>
+            <span>{p.coverageWan} 万元{p.originalCoverageWan && Number(p.originalCoverageWan) !== Number(p.coverageWan)
+              ? <span className="small muted">（原 {p.originalCoverageWan} 万）</span> : null}</span>
             <span className="k">保费</span><span>{fmtMoney(p.premium)}（企业承担）</span>
             <span className="k">岗位风险</span><span><Badge tone={p.jobRiskLevel >= 4 ? 'red' : 'orange'}>L{p.jobRiskLevel}</Badge></span>
           </div>
           <div className="kv">
             <span className="k">企业确认</span><span>{p.enterpriseConfirmed ? <Badge tone="green">已确认承保</Badge> : <Badge tone="orange">未确认</Badge>}</span>
             <span className="k">生效时间</span><span>{p.effectiveFrom ? fmtDateTime(p.effectiveFrom) : '待四重到岗校验通过后即时生效'}</span>
+            <span className="k">岗位调换</span><span>{p.positionTransferId
+              ? <Badge tone="purple">已随确认同步 #{p.positionTransferId}</Badge>
+              : <span className="small muted">未发生调换</span>}</span>
             <span className="k">终止时间</span><span>{p.effectiveTo ? fmtDateTime(p.effectiveTo) : '—'}</span>
             <span className="k">生效凭据</span><span>{p.activatedByAttendanceId ? `锚定签到记录 #${p.activatedByAttendanceId} 的服务器时间` : '—'}</span>
           </div>
@@ -297,14 +322,12 @@ function EventsTab({ room, isWorker, isField, busy, onAct }: any) {
   const [type, setType] = useState('OVERTIME');
   const [desc, setDesc] = useState('');
   const [minutes, setMinutes] = useState(60);
-  const [newPosition, setNewPosition] = useState('');
   const [claimAmount, setClaimAmount] = useState(5000);
 
   const submit = async () => {
     await onAct(() => post('/events', {
       assignmentId: room.assignment.id, type, description: desc,
       minutes: ['OVERTIME', 'EARLY_LEAVE', 'EXTRA_CARRY'].includes(type) ? Number(minutes) : undefined,
-      newPosition: type === 'POSITION_CHANGE' ? newPosition : undefined,
       claimAmount: type === 'INJURY' ? Number(claimAmount) : undefined,
       lat: room.job.lat, lng: room.job.lng, photoUrl: `mock://event-${Date.now()}`,
     }), '事件已现场实时上报（服务器时间不可篡改）');
@@ -332,13 +355,16 @@ function EventsTab({ room, isWorker, isField, busy, onAct }: any) {
               {e.minutes ? <span className="small">{e.minutes} 分钟</span> : null}
               {e.newPosition ? <span className="small">调至：{e.newPosition}</span> : null}
               <div className="spacer" />
-              {isField && e.status === 'PENDING' && (
+              {isField && e.status === 'PENDING' && e.type !== 'POSITION_CHANGE' && (
                 <div className="row">
                   <button className="btn btn-success btn-sm" disabled={busy}
                     onClick={() => onAct(() => post(`/events/${e.id}/review`, { approve: true, note: '现场确认情况属实' }))}>批准</button>
                   <button className="btn btn-danger btn-sm" disabled={busy}
                     onClick={() => onAct(() => post(`/events/${e.id}/review`, { approve: false, note: '情况不属实' }))}>驳回</button>
                 </div>
+              )}
+              {e.type === 'POSITION_CHANGE' && (
+                <span className="small muted">岗位调换以工人在「岗位调换」页的确认为准</span>
               )}
             </div>
             <div className="small" style={{ marginTop: 4 }}>{e.description} {e.photoUrl && '📷'}</div>
@@ -361,9 +387,6 @@ function EventsTab({ room, isWorker, isField, busy, onAct }: any) {
           </Field>
           {['OVERTIME', 'EARLY_LEAVE', 'EXTRA_CARRY'].includes(type) && (
             <Field label="时长（分钟）"><input className="input" type="number" value={minutes} onChange={(e) => setMinutes(Number(e.target.value))} /></Field>
-          )}
-          {type === 'POSITION_CHANGE' && (
-            <Field label="调换后的新岗位"><input className="input" value={newPosition} onChange={(e) => setNewPosition(e.target.value)} /></Field>
           )}
           {type === 'INJURY' && (
             <>
@@ -435,16 +458,27 @@ function SettlementTab({ room, isWorker, isField, busy, onAct, gotoAppeal }: any
           {s && <StatusBadge status={s.status} />}
         </div>
         {!s ? (
-          <Alert kind="info">完工签退后系统自动生成结算明细。</Alert>
+          <Alert kind="info">完工签退后系统自动生成结算明细。岗位调换经工人确认后，系统会立即按新岗位规则预估并展示新工资。</Alert>
         ) : (
           <>
+            {s.settledPosition && (
+              <Alert kind="ok">本单已按确认后的新岗位「{s.settledPosition}」规则结算（原岗位：{room.job.title}），未再套用原岗位工资。</Alert>
+            )}
             {line('有效工时', `${s.workMinutes} 分钟（迟到 ${s.lateMinutes} 分钟，加班 ${s.overtimeMinutes} 分钟）`)}
-            {line('基础工资', fmtMoney(s.baseWage))}
+            {line('基础工资（分段计酬）', fmtMoney(s.baseWage))}
             {line('加班费', `+ ${fmtMoney(s.overtimePay)}`, 'money-green')}
             {line('额外搬运补贴', `+ ${fmtMoney(s.extraCarryPay)}`, 'money-green')}
             {line('餐补', `+ ${fmtMoney(s.mealAllowance)}`, 'money-green')}
+            {Number(s.arrivalCompensation) > 0 && line('到场补偿（拒绝临时调换）', `+ ${fmtMoney(s.arrivalCompensation)}`, 'money-green')}
             {line('迟到扣款', `- ${fmtMoney(s.lateDeduction)}`, s.lateDeduction > 0 ? '' : '')}
             {line('其他扣款', `- ${fmtMoney(s.otherDeduction)}`)}
+            {Number(s.disputedMinutes) > 0 && (
+              <Alert kind="error">
+                争议工时 {s.disputedMinutes} 分钟：未经确认即从事新岗位，对应 {fmtMoney(s.disputedDeduction)} 暂扣、未计入应发，
+                需发起申诉由平台裁决，企业不得直接按原岗位规则把这段时间核销。
+              </Alert>
+            )}
+            {s.disputedReason && <div className="small" style={{ color: 'var(--orange)' }}>工时/补偿说明：{s.disputedReason}</div>}
             {s.deductionReason && <div className="small" style={{ color: 'var(--orange)' }}>扣款说明：{s.deductionReason}</div>}
             <div className="row" style={{ padding: '10px 0' }}>
               <b>工人应发合计</b><div className="spacer" /><span className="money" style={{ fontSize: 20 }}>{fmtMoney(s.workerPayable)}</span>

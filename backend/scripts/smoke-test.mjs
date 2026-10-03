@@ -47,6 +47,7 @@ async function login(username, password = '123456') {
   const tSupRisky = await login('supervisor_risky');
   const tSupRiskyb = await login('supervisor_riskyb');
   const tSupport = await login('support');
+  const tWorker3 = await login('worker3');
   ok(true, '全部种子账号可登录（工人/企业/主管×4/客服）');
 
   console.log('── 2. 报名门禁：实名 / 健康证 / 历史评价 / 风险告知 ──');
@@ -271,6 +272,173 @@ async function login(username, password = '123456') {
   const ind = (await req('GET', '/api/industry-risks', tSupport)).body;
   ok(ind.length === 6 && ind.find((x) => x.industry === 'SECURITY').baseRiskLevel === 5,
     '按六个行业沉淀岗位风险（安保基础风险 5 级、保费费率最高）');
+
+  console.log('── 12. 岗位临时调换（工人确认）：说明强度/风险/工资差异 → 保险与工时同步、争议工时 ──');
+  // 种子内置在途任务：worker3（王强）已到岗「嘉定冷链仓·夜班分拣员」、保险已生效
+  const w3Apps = (await req('GET', '/api/my/applications', tWorker3)).body;
+  const sortApp = w3Apps.find((a) => a.job && a.job.industry === 'WAREHOUSE' && a.status === 'WORKING');
+  ok(!!sortApp, '种子在途分拣任务存在且工人已到岗作业（保险生效中）');
+  const sortAid = sortApp.id;
+
+  // 主管发起时不写工作强度 → 被拦截
+  const badInitiate = await req('POST', '/api/position-transfers', tSup1, {
+    assignmentId: sortAid, newPosition: '重货装卸工', newIndustry: 'EXHIBITION',
+    newWorkIntensity: '', newRiskDescription: '砸伤风险', newDailyWage: 320,
+  });
+  ok(badInitiate.status === 400 && /工作强度/.test(badInitiate.body.message),
+    `发起调换必须书面说明新岗位工作强度：${badInitiate.body.message}`);
+
+  // 工人无权发起岗位调换（必须现场主管发起）
+  const workerInitiate = await req('POST', '/api/position-transfers', tWorker3, {
+    assignmentId: sortAid, newPosition: '重货装卸工', newIndustry: 'EXHIBITION',
+    newWorkIntensity: '重', newRiskDescription: '砸伤', newDailyWage: 320,
+  });
+  ok(workerInitiate.status === 403, '工人不能自行发起岗位调换（须现场主管发起）');
+
+  // 主管正式发起：2 分钟前企业即已要求开始新岗位（制造未确认先作业时段）
+  const twoMinAgo = new Date(Date.now() - 2 * 60000).toISOString().slice(0, 19);
+  const initiate = await req('POST', '/api/position-transfers', tSup1, {
+    assignmentId: sortAid,
+    newPosition: '重货装卸工', newIndustry: 'EXHIBITION',
+    newWorkIntensity: '持续搬运 25kg 箱装重货并装卸车，强度显著高于分拣',
+    newRiskDescription: '重物砸伤、腰肌劳损、装卸车剐蹭',
+    newDailyWage: 320, newOvertimeRate: 45, newCoverageWan: 50,
+    wageDiffNote: '含重货岗位津贴 80 元/班', newWorkStartedAt: twoMinAgo,
+  });
+  ok(initiate.status === 201 && initiate.body.transfer.status === 'PENDING' &&
+    initiate.body.transfer.wageDiffType === 'UP',
+    '主管发起调换（分拣→重货装卸，日薪 240→320），等待工人确认');
+  const trId = initiate.body.transfer.id;
+
+  // 发起后保险仍按原岗位
+  const roomPending = (await req('GET', `/api/assignments/${sortAid}/room`, tWorker3)).body;
+  ok(roomPending.activeTransfer.status === 'PENDING' && roomPending.policy.coverageWan === 30,
+    '工人确认前保险范围维持原岗位（保额 30 万）');
+  const boardBefore = (await req('GET', '/api/field/board', tSup1)).body;
+  ok((boardBefore.pendingTransfers || []).some((t) => t.id === trId), '主管现场工作台出现待工人确认的调换单');
+
+  // 主管不能用通用事件审批接口代替工人确认
+  const linkedEventId = initiate.body.transfer.jobEventId;
+  const supApproveEvent = await req('POST', `/api/events/${linkedEventId}/review`, tSup1, { approve: true, note: '代确认' });
+  ok(supApproveEvent.status === 400 && /工人/.test(supApproveEvent.body.message),
+    `主管不能代为确认岗位调换：${supApproveEvent.body.message}`);
+
+  // 工人确认 → 保险与工时单同步
+  const confirmedTr = await req('POST', `/api/position-transfers/${trId}/confirm`, tWorker3, {});
+  ok(confirmedTr.status === 201 && confirmedTr.body.transfer.status === 'CONFIRMED', '工人确认岗位调换');
+  ok(confirmedTr.body.policy.coverageWan === 50 && confirmedTr.body.policy.currentPosition === '重货装卸工' &&
+    Number(confirmedTr.body.policy.originalCoverageWan) === 30 && confirmedTr.body.policy.positionTransferId === trId,
+    '保险范围同步：承保岗位切换为重货装卸工、保额 30万→50万（原快照保留）');
+  ok(confirmedTr.body.transfer.disputedMinutes >= 1 && Number(confirmedTr.body.settlement.disputedDeduction) > 0,
+    `确认前已作业 ${confirmedTr.body.transfer.disputedMinutes} 分钟标记为争议工时，暂扣 ¥${confirmedTr.body.settlement.disputedDeduction}`);
+  ok(confirmedTr.body.settlement.settledPosition === '重货装卸工' &&
+    /争议工时/.test(confirmedTr.body.settlement.disputedReason || ''),
+    '工时单按新岗位分段计酬并书面标注争议时段');
+
+  // 确认后不能重复操作
+  const confirmAgain = await req('POST', `/api/position-transfers/${trId}/confirm`, tWorker3, {});
+  ok(confirmAgain.status === 400 && /已处理/.test(confirmAgain.body.message), '调换单已确认，不能重复操作');
+
+  // 完工签退后争议时段仍被隔离，不按原岗位规则统算
+  const qrSort = (await req('GET', `/api/jobs/${sortApp.job.id}/qrcode`, tSup1)).body.token;
+  const sortCheckout = await req('POST', '/api/attendance/check-out', tWorker3, {
+    assignmentId: sortAid, lat: 31.2304, lng: 121.4737, qrcodeToken: qrSort, facePassed: true,
+  });
+  const sortS = sortCheckout.body.settlement;
+  ok(sortCheckout.status === 201 && sortS.settledPosition === '重货装卸工' &&
+    sortS.disputedMinutes >= 1 && Number(sortS.disputedDeduction) > 0 &&
+    Number(sortS.workerPayable) > 0,
+    `完工结算按新岗位分段计酬，争议 ${sortS.disputedMinutes} 分钟（¥${sortS.disputedDeduction}）继续暂扣，应发 ¥${sortS.workerPayable}`);
+
+  console.log('── 13. 岗位临时调换（工人拒绝）：拒绝原因 + 到场补偿判定 + 主管复核改判 ──');
+  async function setupOnSiteJob(_workerToken, name) {
+    const u = `wtr${name}${Date.now() % 100000}`;
+    const register = await req('POST', '/api/auth/register', null, {
+      username: u, password: '123456', name: `调换工人${name}`, phone: `13500012${1000 + Number(name)}`, role: 'WORKER',
+      idCardNo: `310101199${name}010${Number(name)}222`, healthCertUntil: '2027-01-01',
+    });
+    const tk = register.body.token;
+    await req('POST', '/api/auth/worker-profile', tk, { faceSampleUrl: 'mock://face-tr' });
+    const st = new Date(Date.now() - 10 * 60000);
+    const ed = new Date(st.getTime() + 6 * 3600000);
+    const j = (await req('POST', '/api/jobs', tEnt1, {
+      title: `临时分拣岗${name}`, industry: 'WAREHOUSE', description: '小件分拣', location: '嘉定物流园',
+      lat: 31.2304, lng: 121.4737,
+      startTime: st.toISOString().slice(0, 19), endTime: ed.toISOString().slice(0, 19),
+      headcount: 1, skillRequirement: '无', dailyWage: 240,
+    })).body;
+    await req('POST', `/api/jobs/${j.id}/apply`, tk, { riskAcknowledged: true });
+    const apps = (await req('GET', `/api/jobs/${j.id}/applicants`, tEnt1)).body;
+    const acc = await req('POST', `/api/assignments/${apps[0].id}/review`, tEnt1, { accept: true });
+    const aid = acc.body.id;
+    const q = (await req('GET', `/api/jobs/${j.id}/qrcode`, tSup1)).body.token;
+    const ci = await req('POST', '/api/attendance/check-in', tk, {
+      assignmentId: aid, lat: 31.2304, lng: 121.4737, qrcodeToken: q, facePassed: true,
+    });
+    // 企业风险等级可能已因工伤/有责争议升至 L4 → 新岗位双人确认，兼容第二名主管复核
+    const c1 = await req('POST', `/api/attendance/${ci.body.attendance.id}/supervisor-confirm`, tSup1, {});
+    if (c1.body.nextStep === 'WAIT_SECOND_CONFIRM') {
+      await req('POST', `/api/attendance/${ci.body.attendance.id}/supervisor-confirm`, tSup1b, {});
+    }
+    return { tk, j, aid };
+  }
+
+  // 13.1 降薪调换被拒绝 → 企业需支付到场补偿（不签退也能结算）
+  const rejectCase = await setupOnSiteJob(tEnt1, '1');
+  const init2 = await req('POST', '/api/position-transfers', tSup1, {
+    assignmentId: rejectCase.aid,
+    newPosition: '重货搬运工', newIndustry: 'EXHIBITION',
+    newWorkIntensity: '持续搬运 30kg 重货', newRiskDescription: '砸伤/腰伤',
+    newDailyWage: 200, newCoverageWan: 50,
+  });
+  const tr2 = init2.body.transfer;
+  ok(Number(tr2.originalDailyWage) === 240 && tr2.wageDiffType === 'DOWN', '第二单为降薪调换（240→200）');
+  const rejectNoReason = await req('POST', `/api/position-transfers/${tr2.id}/reject`, rejectCase.tk, { reason: '' });
+  ok(rejectNoReason.status === 400 && /拒绝.*原因/.test(rejectNoReason.body.message), '拒绝调换必须填写原因');
+  const rejected = await req('POST', `/api/position-transfers/${tr2.id}/reject`, rejectCase.tk, {
+    reason: '腰有旧伤，不能搬重货，且降薪未提前说明',
+  });
+  ok(rejected.body.transfer.status === 'REJECTED' &&
+    rejected.body.transfer.arrivalCompensation === 'REQUIRED' &&
+    Number(rejected.body.transfer.arrivalCompensationAmount) === 50,
+    '平台判定企业需支付到场补偿 ¥50（日薪20%保底50）');
+  const rejS = rejected.body.settlement;
+  ok(!!rejS && Number(rejS.arrivalCompensation) === 50 && Number(rejS.workerPayable) >= 50,
+    `工人未签离场，到场补偿已计入结算单（应发 ¥${rejS?.workerPayable}），不按原岗位全班结算`);
+
+  // 主管复核：工人确已离场 → 维持补偿
+  const maintain = await req('POST', `/api/position-transfers/${tr2.id}/compensation`, tSup1, { continued: false, note: '工人已离厂' });
+  ok(maintain.body.transfer.arrivalCompensation === 'REQUIRED', '主管登记工人已离场，到场补偿维持应付');
+
+  // 客服证据包包含岗位调换完整轨迹
+  const evPack = (await req('GET', `/api/settlements/assignment/${rejectCase.aid}/evidence`, tSupport)).body;
+  const trInPack = evPack.transfers[0];
+  ok(evPack.transfers.length >= 1 && trInPack.status === 'REJECTED' &&
+    trInPack.arrivalCompensation === 'REQUIRED' && Number(trInPack.arrivalCompensationAmount) === 50 &&
+    /旧伤/.test(trInPack.workerRejectReason) && Number(evPack.settlement.arrivalCompensation) === 50,
+    '客服证据包固化岗位调换/拒绝原因/到场补偿判定与结算金额');
+
+  // 13.2 拒绝后留下继续原岗位 → 主管改判无需补偿，完工按原岗位正常结算
+  const stayCase = await setupOnSiteJob(tEnt1, '2');
+  const init3 = await req('POST', '/api/position-transfers', tSup1, {
+    assignmentId: stayCase.aid,
+    newPosition: '重货搬运工', newIndustry: 'EXHIBITION',
+    newWorkIntensity: '重货', newRiskDescription: '砸伤', newDailyWage: 240, newCoverageWan: 50,
+  });
+  await req('POST', `/api/position-transfers/${init3.body.transfer.id}/reject`, stayCase.tk, { reason: '只做约定的分拣' });
+  const waive = await req('POST', `/api/position-transfers/${init3.body.transfer.id}/compensation`, tSup1, {
+    continued: true, note: '工人留下继续分拣至下班',
+  });
+  ok(waive.body.transfer.arrivalCompensation === 'WAIVED' &&
+    Number(waive.body.settlement.arrivalCompensation) === 0,
+    '主管登记工人继续原岗位 → 改判无需到场补偿');
+  const q3 = (await req('GET', `/api/jobs/${stayCase.j.id}/qrcode`, tSup1)).body.token;
+  const co3 = await req('POST', '/api/attendance/check-out', stayCase.tk, {
+    assignmentId: stayCase.aid, lat: 31.2304, lng: 121.4737, qrcodeToken: q3, facePassed: true,
+  });
+  ok(Number(co3.body.settlement.arrivalCompensation) === 0 &&
+    Number(co3.body.settlement.baseWage) === 240 && !co3.body.settlement.settledPosition,
+    '继续原岗位正常完工：无到场补偿、按原岗位日薪 ¥240 结算');
 
   console.log(`\n========== 结果：${pass} 通过 / ${fail} 失败 ==========`);
   process.exit(fail ? 1 : 0);

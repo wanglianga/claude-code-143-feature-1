@@ -32,6 +32,34 @@ export default function FieldBoard() {
       {msg && <Alert kind="ok">{msg}</Alert>}
       {error && <Alert kind="error">{error}</Alert>}
 
+      {data.pendingTransfers?.length > 0 && (
+        <div className="card" style={{ borderColor: 'var(--orange)' }}>
+          <h2>岗位临时调换待办（{data.pendingTransfers.length}）</h2>
+          {data.pendingTransfers.map((t: any) => (
+            <div key={t.id} style={{ padding: '10px 0', borderBottom: '1px solid var(--line)' }}>
+              <div className="row">
+                <Badge tone="orange">{t.status === 'PENDING' ? '待工人确认' : '待到场补偿复核'}</Badge>
+                <b>{t.workerName}</b>
+                <Badge tone="blue">{t.jobTitle}</Badge>
+                <div className="spacer" />
+                <span className="small muted">{fmtDateTime(t.initiatedAt)}</span>
+              </div>
+              <div className="small" style={{ margin: '4px 0' }}>
+                {t.originalPosition} → <b>{t.newPosition}</b>；日薪 ¥{t.originalDailyWage} → ¥{t.newDailyWage}；保额 {t.originalCoverageWan}万 → {t.newCoverageWan}万
+              </div>
+              {t.status === 'REJECTED' && (
+                <div className="small" style={{ color: 'var(--red)', marginBottom: 4 }}>
+                  工人拒绝：{t.workerRejectReason}；平台判定企业需支付到场补偿 ¥{t.arrivalCompensationAmount}，请在任务室内复核工人去向。
+                </div>
+              )}
+              <div className="row">
+                <Link className="btn btn-sm btn-primary" to={`/room/${t.assignmentId}`}>进入任务室处理 →</Link>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
       <div className="grid grid-2">
         <div className="card">
           <h2>待确认到岗（{data.pendingAttendance.length}）</h2>

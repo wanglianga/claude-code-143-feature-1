@@ -3,7 +3,7 @@ import { hash } from 'bcryptjs';
 import { config } from './config';
 import {
   User, Enterprise, Job, Assignment, AttendanceEvent, InsurancePolicy,
-  JobEvent, InjuryClaim, ChatMessage, Settlement, Appeal, Review,
+  JobEvent, InjuryClaim, ChatMessage, Settlement, Appeal, Review, PositionTransfer,
 } from './entities';
 import { INDUSTRIES, depositMultiplier, strictConfirmationRequired } from './risk.constants';
 
@@ -20,7 +20,7 @@ async function dataSource(): Promise<DataSource> {
     database: config.db.database,
     entities: [
       User, Enterprise, Job, Assignment, AttendanceEvent, InsurancePolicy,
-      JobEvent, InjuryClaim, ChatMessage, Settlement, Appeal, Review,
+      JobEvent, InjuryClaim, ChatMessage, Settlement, Appeal, Review, PositionTransfer,
     ],
     charset: 'utf8mb4',
     timezone: '+08:00',
@@ -52,6 +52,12 @@ export async function runSeed() {
   await users.save(users.create({
     username: 'worker2', passwordHash: pwd, name: '李四', phone: '13800000002', role: 'WORKER',
     // 未实名、无健康证、无人脸样本 —— 用于演示报名门禁与考勤拦截
+  }));
+  // 已实名+人脸的在途分拣工人 —— 用于演示到场后岗位临时调换确认
+  await users.save(users.create({
+    username: 'worker3', passwordHash: pwd, name: '王强', phone: '13800000003', role: 'WORKER',
+    idCardNo: '310101199208123456', idVerifiedAt: new Date(),
+    healthCertUntil: '2027-12-31', faceSampleUrl: 'seed://face-wangqiang',
   }));
   void worker1;
 
@@ -189,7 +195,56 @@ export async function runSeed() {
   demo.prepayment = 300;
   await jobs.save(demo);
 
-  console.log('[seed] 种子数据完成：worker1/worker2/enterprise1/supervisor1/enterprise_risky/support，密码均为 123456');
+  // ---------- 在途「仓库分拣」任务：worker3（王强）已到岗、保险生效，可直接演示岗位临时调换 ----------
+  const worker3 = await users.findOne({ where: { username: 'worker3' } });
+  const sup1 = await users.findOne({ where: { username: 'supervisor1' } });
+  const sortJob = await jobs.save(jobs.create({
+    enterpriseId: ent1.id,
+    title: '嘉定冷链仓·夜班分拣员', industry: 'WAREHOUSE',
+    description: '生鲜小件分拣、码拍、笼车推送；不含重货装卸。',
+    location: '上海市嘉定区丰茂路物流园 7 号冷库',
+    lat: 31.2304, lng: 121.4737,
+    startTime: iso(-20), endTime: iso(340), headcount: 2,
+    skillRequirement: '无特殊要求', requireHealthCert: false, dressCode: '保暖马甲+防滑鞋',
+    dailyWage: 240, overtimeRate: 28, mealAllowance: 20,
+    lateDeductPerMin: 2, lateGraceMinutes: 5,
+    insuranceCoverageWan: 30,
+    insurancePremium: Math.round(240 * INDUSTRIES.WAREHOUSE.insuranceRate * 100) / 100,
+    settlementMethod: '日结-完工24小时内', platformFeeRate: 0.08,
+    status: 'IN_PROGRESS',
+    depositRequired: Math.round(INDUSTRIES.WAREHOUSE.baseDeposit * depositMultiplier(ent1.riskLevel) * 2),
+    depositPaid: true, strictConfirmation: false, prepayment: 200,
+  }));
+  ent1.depositFrozen = Number(ent1.depositFrozen) + Number(sortJob.depositRequired);
+  ent1.depositBalance = Number(ent1.depositBalance) - Number(sortJob.depositRequired);
+  await enterprises.save(ent1);
+
+  const assignments = source.getRepository(Assignment);
+  const attendance = source.getRepository(AttendanceEvent);
+  const policies = source.getRepository(InsurancePolicy);
+
+  const arrivedAt = new Date(now - 10 * 60000);
+  const sortAssignment = await assignments.save(assignments.create({
+    jobId: sortJob.id, workerId: worker3!.id, status: 'WORKING',
+    riskAcknowledged: true, appliedAt: new Date(now - 60 * 60000), acceptedAt: new Date(now - 30 * 60000),
+    ratingSnapshot: 5, completedJobsCount: 0,
+  }));
+  await attendance.save(attendance.create({
+    assignmentId: sortAssignment.id, jobId: sortJob.id, workerId: worker3!.id, kind: 'CHECK_IN',
+    locationPassed: true, lat: 31.2304, lng: 121.4737, distanceMeters: 0,
+    facePassed: true, faceScore: 95,
+    supervisorConfirmed: true, confirmedBySupervisorId: sup1!.id, confirmedAt: arrivedAt,
+    qrcodePassed: true, qrcodeToken: 'SEEDQR01', secondConfirmed: true, allPassed: true,
+    failReason: null, photoUrl: 'seed://sort-checkin', eventTime: arrivedAt,
+  }));
+  await policies.save(policies.create({
+    assignmentId: sortAssignment.id, jobId: sortJob.id, workerId: worker3!.id, enterpriseId: ent1.id,
+    insurerProduct: '物流分拣雇主责任险', coverageWan: 30, premium: sortJob.insurancePremium,
+    status: 'ACTIVE', effectiveFrom: arrivedAt,
+    jobRiskLevel: INDUSTRIES.WAREHOUSE.baseRiskLevel, enterpriseConfirmed: true,
+  }));
+
+  console.log('[seed] 种子数据完成：worker1/worker2/worker3/enterprise1/supervisor1/enterprise_risky/support，密码均为 123456');
 }
 
 if (require.main === module) {

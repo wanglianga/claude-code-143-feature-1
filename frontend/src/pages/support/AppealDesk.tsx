@@ -101,6 +101,38 @@ export default function AppealDesk() {
             </div>
           ))}
           {d.events.length === 0 && <div className="muted small">无作业事件</div>}
+
+          <h2 style={{ marginTop: 16 }}>岗位临时调换（{(d.transfers || []).length}）</h2>
+          {(d.transfers || []).length === 0 && <div className="muted small">无岗位调换记录</div>}
+          {(d.transfers || []).map((t: any) => (
+            <div key={t.id} style={{ padding: '8px 0', borderBottom: '1px dashed var(--line)' }}>
+              <div className="row">
+                {t.status === 'CONFIRMED' ? <Badge tone="green">工人已确认</Badge>
+                  : t.status === 'REJECTED' ? <Badge tone="red">工人已拒绝</Badge>
+                  : <Badge tone="orange">待工人确认</Badge>}
+                <b className="small">{t.originalPosition} → {t.newPosition}</b>
+                <span className="small muted">{fmtDateTime(t.initiatedAt)}</span>
+              </div>
+              <div className="small" style={{ marginTop: 2 }}>
+                日薪 ¥{t.originalDailyWage} → ¥{t.newDailyWage}（{t.wageDiffType}）；保额 {t.originalCoverageWan}万 → {t.newCoverageWan}万；
+                强度：{t.newWorkIntensity}；风险：{t.newRiskDescription}
+              </div>
+              {t.workerConfirmedAt && (
+                <div className="small">工人确认于 {fmtDateTime(t.workerConfirmedAt)}
+                  {t.disputedMinutes > 0 && <b style={{ color: 'var(--red)' }}>；争议工时 {t.disputedMinutes} 分钟（暂扣 ¥{t.disputedDeduction ?? 0}）</b>}
+                </div>
+              )}
+              {t.workerRejectReason && (
+                <div className="small" style={{ color: 'var(--red)' }}>拒绝原因：{t.workerRejectReason}</div>
+              )}
+              <div className="small">
+                到场补偿：{t.arrivalCompensation === 'REQUIRED'
+                  ? <b style={{ color: 'var(--red)' }}>企业需付 ¥{t.arrivalCompensationAmount}</b>
+                  : t.arrivalCompensation === 'WAIVED' ? '无需补偿（工人继续原岗位）' : '待判定'}
+                {t.arrivalCompensationReason && <div className="small muted" style={{ whiteSpace: 'pre-wrap' }}>{t.arrivalCompensationReason}</div>}
+              </div>
+            </div>
+          ))}
         </div>
 
         <div>
@@ -124,6 +156,7 @@ export default function AppealDesk() {
             {d.policy ? (
               <div className="kv">
                 <span className="k">保单状态</span><span><StatusBadge status={d.policy.status} /></span>
+                <span className="k">承保岗位</span><span>{d.policy.currentPosition || '原岗位'}{d.policy.originalCoverageWan ? `（原 ${d.policy.originalCoverageWan}万→现 ${d.policy.coverageWan}万）` : `（${d.policy.coverageWan}万）`}</span>
                 <span className="k">生效时间</span><span>{d.policy.effectiveFrom ? fmtDateTime(d.policy.effectiveFrom) : '未生效'}</span>
                 <span className="k">终止时间</span><span>{d.policy.effectiveTo ? fmtDateTime(d.policy.effectiveTo) : '—'}</span>
                 <span className="k">岗位风险</span><span>L{d.policy.jobRiskLevel}</span>
@@ -132,11 +165,16 @@ export default function AppealDesk() {
             <div className="fab-space" />
             {d.settlement ? (
               <div className="kv">
+                <span className="k">结算岗位</span><span>{d.settlement.settledPosition || '原岗位'}</span>
                 <span className="k">工时</span><span>{d.settlement.workMinutes} 分（迟到 {d.settlement.lateMinutes}，加班 {d.settlement.overtimeMinutes}）</span>
                 <span className="k">基础工资</span><span>{fmtMoney(d.settlement.baseWage)}</span>
                 <span className="k">加班费</span><span>+{fmtMoney(d.settlement.overtimePay)}</span>
                 <span className="k">餐补</span><span>+{fmtMoney(d.settlement.mealAllowance)}</span>
+                {Number(d.settlement.arrivalCompensation) > 0 && <><span className="k">到场补偿</span><span>+{fmtMoney(d.settlement.arrivalCompensation)}</span></>}
                 <span className="k">迟到扣款</span><span className="money">-{fmtMoney(d.settlement.lateDeduction)}</span>
+                {Number(d.settlement.disputedMinutes) > 0 && (
+                  <><span className="k">争议工时</span><span style={{ color: 'var(--red)' }}>{d.settlement.disputedMinutes} 分暂扣 {fmtMoney(d.settlement.disputedDeduction)}</span></>
+                )}
                 <span className="k">应发工人</span><span className="money">{fmtMoney(d.settlement.workerPayable)}</span>
                 <span className="k">结算状态</span><span><StatusBadge status={d.settlement.status} /></span>
               </div>

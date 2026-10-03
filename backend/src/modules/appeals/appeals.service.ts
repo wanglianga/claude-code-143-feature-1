@@ -3,7 +3,7 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import {
   Appeal, Assignment, Job, Enterprise, AttendanceEvent, JobEvent, ChatMessage,
-  Settlement, InsurancePolicy, InjuryClaim,
+  Settlement, InsurancePolicy, InjuryClaim, PositionTransfer,
 } from '../../entities';
 import { SettlementService } from '../settlements/settlement.service';
 import { EnterpriseService } from '../enterprise/enterprise.service';
@@ -20,6 +20,7 @@ export class AppealsService {
     @InjectRepository(ChatMessage) private messages: Repository<ChatMessage>,
     @InjectRepository(Settlement) private settlements: Repository<Settlement>,
     @InjectRepository(InjuryClaim) private claims: Repository<InjuryClaim>,
+    @InjectRepository(PositionTransfer) private transfers: Repository<PositionTransfer>,
     private settlementService: SettlementService,
     private entService: EnterpriseService,
   ) {}
@@ -82,6 +83,7 @@ export class AppealsService {
     const msgs = await this.messages.find({ where: { assignmentId }, order: { id: 'ASC' }, take: 300 });
     const settlement = await this.settlements.findOne({ where: { assignmentId } });
     const policy = await this.appeals.manager.findOne(InsurancePolicy, { where: { assignmentId } });
+    const transfers = await this.transfers.find({ where: { assignmentId }, order: { id: 'ASC' } });
 
     const summary = [
       `签到记录 ${att.length} 条：`,
@@ -94,12 +96,20 @@ export class AppealsService {
         `  - [${x.type}] ${new Date(x.occurredAt).toLocaleString('zh-CN')} ${x.status} ${x.description}` +
         `${x.minutes ? `(${x.minutes}分钟)` : ''}${x.photoUrl ? ' 附照片' : ''} 审核:${x.reviewNote || '-'}`,
       ),
-      `保险：${policy ? `${policy.status}，生效 ${policy.effectiveFrom ? new Date(policy.effectiveFrom).toLocaleString('zh-CN') : '未生效'}` : '无保单'}`,
-      `结算：${settlement ? `应发 ¥${settlement.workerPayable}，迟到扣款 ¥${settlement.lateDeduction}，状态 ${settlement.status}` : '未生成'}`,
+      `岗位临时调换 ${transfers.length} 单：`,
+      ...transfers.map((x) =>
+        `  - [${x.status}] ${new Date(x.initiatedAt).toLocaleString('zh-CN')} ${x.originalPosition} → ${x.newPosition} ` +
+        `日薪 ¥${x.originalDailyWage} → ¥${x.newDailyWage}（${x.wageDiffType}）保额 ${x.originalCoverageWan}万 → ${x.newCoverageWan}万 ` +
+        `${x.workerConfirmedAt ? `工人确认于 ${new Date(x.workerConfirmedAt).toLocaleString('zh-CN')}` : ''}` +
+        `${x.disputedMinutes ? ` 争议工时 ${x.disputedMinutes} 分钟` : ''}` +
+        `${x.workerRejectReason ? ` 拒绝原因：${x.workerRejectReason}` : ''}` +
+        ` 到场补偿：${x.arrivalCompensation} ¥${x.arrivalCompensationAmount}`),
+      `保险：${policy ? `${policy.status}，承保岗位 ${policy.currentPosition || policy.originalPosition || '原岗位'}，保额 ${policy.coverageWan}万，生效 ${policy.effectiveFrom ? new Date(policy.effectiveFrom).toLocaleString('zh-CN') : '未生效'}` : '无保单'}`,
+      `结算：${settlement ? `应发 ¥${settlement.workerPayable}，迟到扣款 ¥${settlement.lateDeduction}，争议工时 ${settlement.disputedMinutes} 分钟暂扣 ¥${settlement.disputedDeduction}，到场补偿 ¥${settlement.arrivalCompensation}，状态 ${settlement.status}` : '未生成'}`,
       `聊天记录 ${msgs.length} 条（详见证据包）`,
     ].join('\n');
 
-    return { attendance: att, events, messages: msgs, settlement, policy, summary };
+    return { attendance: att, events, messages: msgs, settlement, policy, transfers, summary };
   }
 
   async evidence(appealId: number) {

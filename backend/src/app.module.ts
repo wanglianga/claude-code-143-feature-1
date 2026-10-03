@@ -3,7 +3,7 @@ import { TypeOrmModule } from '@nestjs/typeorm';
 import { config } from './config';
 import {
   User, Enterprise, Job, Assignment, AttendanceEvent, InsurancePolicy,
-  JobEvent, InjuryClaim, ChatMessage, Settlement, Appeal, Review,
+  JobEvent, InjuryClaim, ChatMessage, Settlement, Appeal, Review, PositionTransfer,
 } from './entities';
 import { AuthModule } from './modules/auth/auth.module';
 import { RiskModule } from './modules/risk/risk.module';
@@ -14,6 +14,7 @@ import { JobsModule } from './modules/jobs/jobs.module';
 import { AppealsModule } from './modules/appeals/appeals.module';
 import { ReviewsModule } from './modules/reviews/reviews.module';
 import { DashboardModule } from './modules/dashboard/dashboard.module';
+import { PositionTransfersModule } from './modules/position-transfers/position-transfers.module';
 
 @Module({
   imports: [
@@ -26,7 +27,7 @@ import { DashboardModule } from './modules/dashboard/dashboard.module';
       database: config.db.database,
       entities: [
         User, Enterprise, Job, Assignment, AttendanceEvent, InsurancePolicy,
-        JobEvent, InjuryClaim, ChatMessage, Settlement, Appeal, Review,
+        JobEvent, InjuryClaim, ChatMessage, Settlement, Appeal, Review, PositionTransfer,
       ],
       synchronize: true,
       charset: 'utf8mb4',
@@ -43,6 +44,7 @@ import { DashboardModule } from './modules/dashboard/dashboard.module';
     AppealsModule,
     ReviewsModule,
     DashboardModule,
+    PositionTransfersModule,
   ],
 })
 export class AppModule {}

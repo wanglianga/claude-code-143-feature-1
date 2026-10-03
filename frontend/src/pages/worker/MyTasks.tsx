@@ -5,8 +5,16 @@ import { Badge, Spinner, StatusBadge, fmtDate, fmtMoney } from '../../components
 
 export default function MyTasks() {
   const [list, setList] = useState<any[]>([]);
+  const [pendingTransferIds, setPendingTransferIds] = useState<Set<number>>(new Set());
   const [loading, setLoading] = useState(true);
-  useEffect(() => { get('/my/applications').then(setList).finally(() => setLoading(false)); }, []);
+  useEffect(() => {
+    Promise.all([get('/my/applications'), get('/position-transfers/mine/pending').catch(() => [])])
+      .then(([apps, pending]) => {
+        setList(apps);
+        setPendingTransferIds(new Set((pending as any[]).map((t) => t.assignmentId)));
+      })
+      .finally(() => setLoading(false));
+  }, []);
 
   if (loading) return <Spinner />;
 
@@ -22,6 +30,7 @@ export default function MyTasks() {
               <div className="row">
                 <Badge tone="blue">{a.job.industryLabel}</Badge>
                 <b>{a.job.title}</b>
+                {pendingTransferIds.has(a.id) && <Badge tone="orange">⚠️ 岗位调换待确认</Badge>}
                 <div className="spacer" />
                 <StatusBadge status={a.status} />
               </div>

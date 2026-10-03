@@ -3,7 +3,7 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { Repository, In } from 'typeorm';
 import {
   User, Enterprise, Job, Assignment, AttendanceEvent, InsurancePolicy,
-  JobEvent, InjuryClaim, ChatMessage, Settlement,
+  JobEvent, InjuryClaim, ChatMessage, Settlement, PositionTransfer,
 } from '../../entities';
 import { INDUSTRIES } from '../../risk.constants';
 import { haversineMeters } from '../../geo';
@@ -43,6 +43,7 @@ export class TasksService {
     @InjectRepository(InjuryClaim) private claims: Repository<InjuryClaim>,
     @InjectRepository(ChatMessage) private messages: Repository<ChatMessage>,
     @InjectRepository(Settlement) private settlements: Repository<Settlement>,
+    @InjectRepository(PositionTransfer) private transfers: Repository<PositionTransfer>,
     private settlementService: SettlementService,
     private entService: EnterpriseService,
   ) {}
@@ -62,6 +63,7 @@ export class TasksService {
     const claim = await this.claims.findOne({ where: { assignmentId }, order: { id: 'DESC' } });
     const msgs = await this.messages.find({ where: { assignmentId }, order: { id: 'ASC' }, take: 200 });
     const settlement = await this.settlements.findOne({ where: { assignmentId } });
+    const transfers = await this.transfers.find({ where: { assignmentId }, order: { id: 'DESC' } });
 
     return {
       assignment,
@@ -80,6 +82,8 @@ export class TasksService {
       claim,
       messages: msgs,
       settlement,
+      positionTransfers: transfers,
+      activeTransfer: transfers[0] || null,
     };
   }
 
@@ -384,6 +388,10 @@ export class TasksService {
     const job = await this.jobs.findOne({ where: { id: event.jobId } });
     if (user.enterpriseId !== job.enterpriseId) throw new ForbiddenException();
     if (event.status !== 'PENDING') throw new BadRequestException('该事件已处理');
+    // 岗位调换必须由工人本人在岗位调换单上确认/拒绝，主管不能代替确认
+    if (event.type === 'POSITION_CHANGE') {
+      throw new BadRequestException('岗位调换须由工人在任务室确认或拒绝，主管不能代为批准');
+    }
     event.status = approve ? 'APPROVED' : 'REJECTED';
     event.reviewedBy = user.sub;
     event.reviewedAt = new Date();
@@ -479,7 +487,31 @@ export class TasksService {
       }
     }
 
-    return { pendingAttendance, recentAttendance: recentAttendance.slice(0, 20), pendingEvents, jobs };
+    // 岗位临时调换：待工人确认，或工人拒绝后待主管做到场补偿复核
+    const pendingTransfers: any[] = [];
+    if (jobIds.length) {
+      const trs = await this.transfers.find({
+        where: { jobId: In(jobIds) },
+        order: { id: 'DESC' },
+        take: 100,
+      });
+      for (const t of trs) {
+        const needFollowUp = t.status === 'PENDING' ||
+          (t.status === 'REJECTED' && t.arrivalCompensation === 'REQUIRED' && t.compensationResolvedAt === null);
+        if (!needFollowUp) continue;
+        const w = await this.users.findOne({ where: { id: t.workerId } });
+        pendingTransfers.push({
+          ...t,
+          workerName: w?.name || `#${t.workerId}`,
+          jobTitle: jobMap.get(t.jobId)?.title,
+        });
+      }
+    }
+
+    return {
+      pendingAttendance, recentAttendance: recentAttendance.slice(0, 20),
+      pendingEvents, pendingTransfers, jobs,
+    };
   }
 
   // ===================== 爽约标记 =====================

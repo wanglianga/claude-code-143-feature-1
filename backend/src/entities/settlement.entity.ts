@@ -36,6 +36,28 @@ export class Settlement {
   @Column({ type: 'int', default: 0 })
   lateMinutes: number; // 迟到分钟（超出宽限期）
 
+  // ---------- 岗位临时调换 ----------
+  // 工人确认岗位调换后，结算按新岗位规则（新岗位名称留痕）
+  @Column({ length: 128, nullable: true })
+  settledPosition: string | null;
+
+  // 未确认就开始作业的争议时段（分钟）——不计入正常工资，单独列示待裁决
+  @Column({ type: 'int', default: 0 })
+  disputedMinutes: number;
+
+  @Column({ type: 'decimal', precision: 10, scale: 2, default: 0 })
+  disputedDeduction: number;
+
+  @Column({ type: 'text', nullable: true })
+  disputedReason: string | null;
+
+  // 工人拒绝岗位调换后企业仍需支付的到场补偿
+  @Column({ type: 'decimal', precision: 10, scale: 2, default: 0 })
+  arrivalCompensation: number;
+
+  @Column({ type: 'int', nullable: true })
+  positionTransferId: number | null;
+
   // ---- 金额明细 ----
   @Column({ type: 'decimal', precision: 10, scale: 2, default: 0 })
   baseWage: number; // 按有效工时折算的基础工资

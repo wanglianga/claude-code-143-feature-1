@@ -57,6 +57,25 @@ export class InsurancePolicy {
   @Column({ type: 'boolean', default: false })
   enterpriseConfirmed: boolean;
 
+  // ---------- 岗位临时调换后的保险范围同步 ----------
+  // 确认岗位调换后，承保岗位由原岗位切换为新岗位（保留原岗位快照便于审计）
+  @Column({ length: 128, nullable: true })
+  originalPosition: string | null;
+
+  @Column({ length: 128, nullable: true })
+  currentPosition: string | null;
+
+  // 调换前保额/保费/风险快照
+  @Column({ type: 'int', nullable: true })
+  originalCoverageWan: number | null;
+
+  @Column({ type: 'decimal', precision: 10, scale: 2, nullable: true })
+  originalPremium: number | null;
+
+  // 触发保险范围变更的岗位调换确认单
+  @Column({ type: 'int', nullable: true })
+  positionTransferId: number | null;
+
   @CreateDateColumn()
   createdAt: Date;
 }
