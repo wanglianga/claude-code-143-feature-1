@@ -132,6 +132,134 @@ async function login(username, password = '123456') {
   const msg2 = await req('POST', `/api/assignments/${assignmentId}/messages`, tSup1, { content: '已确认，安心干活' });
   ok(msg.status === 201 && msg2.status === 201, '任务内聊天留存（争议证据链）');
 
+  console.log('── 5b. 到场临时岗位调换：主管发起 → 工人确认（保险/工时同步） ──');
+  // 用另一条派单走完整调换确认：新发岗位 → 录取 → 四重到岗 → 主管发起调换 → 工人确认
+  const pcStart = new Date(Date.now() + 3600 * 1000);
+  const pcEnd = new Date(pcStart.getTime() + 8 * 3600000);
+  const pcJob = (await req('POST', '/api/jobs', tEnt1, {
+    title: '仓库分拣（到场或改重货搬运）', industry: 'WAREHOUSE', description: '分拣，到场可能临时调整',
+    location: '嘉定物流园', lat: 31.2304, lng: 121.4737,
+    startTime: pcStart.toISOString().slice(0, 19), endTime: pcEnd.toISOString().slice(0, 19),
+    headcount: 1, skillRequirement: '无', dailyWage: 240,
+  })).body;
+  const pcApply = await req('POST', `/api/jobs/${pcJob.id}/apply`, tWorker1, { riskAcknowledged: true });
+  void pcApply;
+  const pcApps = (await req('GET', `/api/jobs/${pcJob.id}/applicants`, tEnt1)).body;
+  const pcApp = pcApps.find((x) => x.worker && x.worker.name === '张三');
+  const pcAccept = await req('POST', `/api/assignments/${pcApp.id}/review`, tEnt1, { accept: true });
+  const pcAid = pcAccept.body.id;
+  const qrPc = (await req('GET', `/api/jobs/${pcJob.id}/qrcode`, tSup1)).body.token;
+  const pcCi = await req('POST', '/api/attendance/check-in', tWorker1, {
+    assignmentId: pcAid, lat: 31.2304, lng: 121.4737, qrcodeToken: qrPc, facePassed: true,
+  });
+  const pcConfirmedIn = await req('POST', `/api/attendance/${pcCi.body.attendance.id}/supervisor-confirm`, tSup1, {});
+  ok(pcConfirmedIn.body.insurancePolicy.status === 'ACTIVE', '调换演示派单完成到岗、保险生效');
+
+  // 主管发起：缺强度/风险说明必须被拦截
+  const badProp = await req('POST', '/api/position-changes', tSup1, {
+    assignmentId: pcAid, newPosition: '重货搬运', intensityLevel: 5, intensityNote: '', riskNote: '', newDailyWage: 200,
+  });
+  ok(badProp.status === 400 && /强度/.test(badProp.body.message), `发起调换须说明工作强度：${badProp.body.message}`);
+
+  // 工人不能自行发起（越权）
+  const workerProp = await req('POST', '/api/position-changes', tWorker1, {
+    assignmentId: pcAid, newPosition: '重货搬运', intensityLevel: 5,
+    intensityNote: '重', riskNote: '高', newDailyWage: 200,
+  });
+  ok(workerProp.status === 403, '工人无权自行发起岗位变更');
+
+  // 主管正常发起：分拣(240) → 重货搬运(300)，强度 L5
+  const prop = await req('POST', '/api/position-changes', tSup1, {
+    assignmentId: pcAid, newPosition: '重货搬运', newIndustryKey: null, intensityLevel: 5,
+    intensityNote: '单件30-50kg持续搬卸，需弯腰负重', riskNote: '砸伤扭伤风险升高，配护腰手套',
+    newDailyWage: 300,
+  });
+  ok(prop.status === 201 && prop.body.request.status === 'PROPOSED'
+    && Number(prop.body.request.wageDiff) === 60 && prop.body.request.newRiskLevel >= 4,
+    `主管发起调换（强度L5→风险L${prop.body.request.newRiskLevel}，工资差 +60）`);
+  const pcId = prop.body.request.id;
+  const pcRoom = (await req('GET', `/api/assignments/${pcAid}/room`, tWorker1)).body;
+  ok(pcRoom.activePositionChange && pcRoom.activePositionChange.id === pcId, '任务室向工人展示待确认调换及差异说明');
+
+  // 确认前保险仍是原方案
+  const policyBefore = pcRoom.policy;
+  ok(policyBefore.coverageWan === pcJob.insuranceCoverageWan && !policyBefore.adjustedByPositionChangeId,
+    '工人确认前保险范围保持原分拣岗位方案不变');
+
+  // 重复发起被拒
+  const dupProp = await req('POST', '/api/position-changes', tSup1, {
+    assignmentId: pcAid, newPosition: '其他', intensityLevel: 4, intensityNote: 'x', riskNote: 'y', newDailyWage: 260,
+  });
+  ok(dupProp.status === 400 && /等待工人确认/.test(dupProp.body.message), '已有待确认调换时不能重复发起');
+
+  // 不填说明不能确认
+  const noNote = await req('POST', `/api/position-changes/${pcId}/respond`, tWorker1, { accept: true, note: '' });
+  ok(noNote.status === 400 && /知悉/.test(noNote.body.message), '工人确认须填写知悉声明');
+
+  // 主管发起后、工人确认前的作业时段 = 争议工时：等待约 1 分钟再确认
+  await new Promise((r) => setTimeout(r, 61000));
+
+  // 工人确认 → 保险范围同步更新
+  const acceptPc = await req('POST', `/api/position-changes/${pcId}/respond`, tWorker1,
+    { accept: true, note: '我已知悉新岗位强度风险与工资，确认接受' });
+  ok(acceptPc.status === 201 && acceptPc.body.request.status === 'CONFIRMED', '工人确认岗位调换');
+  ok(acceptPc.body.insurancePolicy.adjustedByPositionChangeId === pcId
+    && Number(acceptPc.body.insurancePolicy.coverageWan) >= Number(policyBefore.coverageWan)
+    && acceptPc.body.insurancePolicy.jobRiskLevel === prop.body.request.newRiskLevel,
+    `保险范围已同步更新（保额 ${policyBefore.coverageWan}万→${acceptPc.body.insurancePolicy.coverageWan}万，风险 L${acceptPc.body.insurancePolicy.jobRiskLevel}）`);
+  const pcRoom2 = (await req('GET', `/api/assignments/${pcAid}/room`, tWorker1)).body;
+  ok(pcRoom2.confirmedPositionChange && /重货搬运/.test(pcRoom2.messages[pcRoom2.messages.length - 1].content),
+    '工人端任务室展示新工资与保险范围，并留存系统确认消息');
+
+  // 确认后继续作业约 1 分钟再签退，形成新岗位作业段
+  await new Promise((r) => setTimeout(r, 61000));
+  const qrPc2 = (await req('GET', `/api/jobs/${pcJob.id}/qrcode`, tSup1)).body.token;
+  const pcOut = await req('POST', '/api/attendance/check-out', tWorker1, {
+    assignmentId: pcAid, lat: 31.2304, lng: 121.4737, qrcodeToken: qrPc2, facePassed: true,
+  });
+  const pcS = pcOut.body.settlement;
+  ok(pcOut.status === 201 && pcS.positionChangeId === pcId, '签退后结算单关联岗位调换单');
+  ok(Number(pcS.disputedMinutes) >= 1 && Number(pcS.newPositionPay) > 0 && Number(pcS.oldPositionPay) > 0,
+    `工时单分段：争议工时 ${pcS.disputedMinutes} 分钟（发起→确认未确认即作业），原岗位段 ¥${pcS.oldPositionPay}，新岗位段 ¥${pcS.newPositionPay}`);
+
+  console.log('── 5c. 工人拒绝不合理调换 → 平台判定到场补偿，不按新岗位规则结算 ──');
+  const rjStart = new Date(Date.now() + 2 * 3600000);
+  const rjJob = (await req('POST', '/api/jobs', tEnt1, {
+    title: '仓库分拣（到场或被降薪调岗）', industry: 'WAREHOUSE', description: '分拣',
+    location: '嘉定物流园', lat: 31.2304, lng: 121.4737,
+    startTime: rjStart.toISOString().slice(0, 19),
+    endTime: new Date(rjStart.getTime() + 8 * 3600000).toISOString().slice(0, 19),
+    headcount: 1, skillRequirement: '无', dailyWage: 240,
+  })).body;
+  await req('POST', `/api/jobs/${rjJob.id}/apply`, tWorker1, { riskAcknowledged: true });
+  const rjApps = (await req('GET', `/api/jobs/${rjJob.id}/applicants`, tEnt1)).body;
+  const rjApp = rjApps.find((x) => x.worker && x.worker.name === '张三');
+  const rjAccept = await req('POST', `/api/assignments/${rjApp.id}/review`, tEnt1, { accept: true });
+  const rjAid = rjAccept.body.id;
+  const qrRj = (await req('GET', `/api/jobs/${rjJob.id}/qrcode`, tSup1)).body.token;
+  const rjCi = await req('POST', '/api/attendance/check-in', tWorker1, {
+    assignmentId: rjAid, lat: 31.2304, lng: 121.4737, qrcodeToken: qrRj, facePassed: true,
+  });
+  await req('POST', `/api/attendance/${rjCi.body.attendance.id}/supervisor-confirm`, tSup1, {});
+  // 降薪 + 高强度的不合理调换
+  const rjProp = await req('POST', '/api/position-changes', tSup1, {
+    assignmentId: rjAid, newPosition: '重货搬运', intensityLevel: 5,
+    intensityNote: '重货持续负重', riskNote: '高风险', newDailyWage: 180,
+  });
+  const rejectPc = await req('POST', `/api/position-changes/${rjProp.body.request.id}/respond`, tWorker1,
+    { accept: false, note: '到场是分拣，降薪还让搬重货，不同意' });
+  ok(rejectPc.body.request.status === 'REJECTED'
+    && rejectPc.body.request.appearanceCompensationRequired === true
+    && Number(rejectPc.body.request.appearanceCompensationAmount) === 48,
+    `工人拒绝降薪高强度调换 → 企业须付到场补偿 ¥${rejectPc.body.request.appearanceCompensationAmount}（240×20%）`);
+  const qrRj2 = (await req('GET', `/api/jobs/${rjJob.id}/qrcode`, tSup1)).body.token;
+  const rjOut = await req('POST', '/api/attendance/check-out', tWorker1, {
+    assignmentId: rjAid, lat: 31.2304, lng: 121.4737, qrcodeToken: qrRj2, facePassed: true,
+  });
+  ok(Number(rjOut.body.settlement.appearanceCompensation) === 48
+    && Number(rjOut.body.settlement.baseWage) > 0,
+    '拒绝后结算按原岗位规则且含到场补偿，未按新岗位工资结算');
+
   console.log('── 6. 保险不可事后补录（未到岗先受伤 → 不能立案为保险事故） ──');
   // 新工人：注册+实名+健康证+人脸
   const uname = `wnew${Date.now() % 100000}`;

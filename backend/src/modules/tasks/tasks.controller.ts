@@ -61,6 +61,19 @@ export class TasksController {
     return this.tasks.reviewEvent(req.user, Number(id), !!dto.approve, dto.note);
   }
 
+  // ---------- 到场后临时岗位调换确认 ----------
+  @Roles('SUPERVISOR', 'ENTERPRISE')
+  @Post('position-changes')
+  proposePositionChange(@Req() req: any, @Body() dto: any) {
+    return this.tasks.proposePositionChange(req.user, dto);
+  }
+
+  @Roles('WORKER')
+  @Post('position-changes/:id/respond')
+  respondPositionChange(@Param('id') id: string, @Body() dto: { accept: boolean; note?: string }, @Req() req: any) {
+    return this.tasks.respondPositionChange(req.user.sub, Number(id), !!dto.accept, dto.note);
+  }
+
   // ---------- 任务内聊天 ----------
   @Post('assignments/:id/messages')
   postMessage(@Param('id') id: string, @Body() dto: { content: string }, @Req() req: any) {

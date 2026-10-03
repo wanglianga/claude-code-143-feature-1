@@ -2,7 +2,7 @@ import { Module } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import {
   Appeal, Assignment, Job, Enterprise, AttendanceEvent, JobEvent, ChatMessage,
-  Settlement, InsurancePolicy, InjuryClaim, User, Review,
+  Settlement, InsurancePolicy, InjuryClaim, User, Review, PositionChangeRequest,
 } from '../../entities';
 import { AppealsService } from './appeals.service';
 import { AppealsController } from './appeals.controller';
@@ -12,7 +12,7 @@ import { SettlementModule } from '../settlements/settlement.module';
   imports: [
     TypeOrmModule.forFeature([
       Appeal, Assignment, Job, Enterprise, AttendanceEvent, JobEvent, ChatMessage,
-      Settlement, InsurancePolicy, InjuryClaim, User, Review,
+      Settlement, InsurancePolicy, InjuryClaim, User, Review, PositionChangeRequest,
     ]),
     SettlementModule,
   ],

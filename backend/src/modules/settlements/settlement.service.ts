@@ -3,7 +3,7 @@ import { InjectRepository, InjectDataSource } from '@nestjs/typeorm';
 import { Repository, DataSource, In } from 'typeorm';
 import {
   Settlement, Job, Assignment, AttendanceEvent, JobEvent, InsurancePolicy,
-  Enterprise, Appeal, User,
+  Enterprise, Appeal, User, PositionChangeRequest,
 } from '../../entities';
 import { round2, minutesBetween } from '../../geo';
 
@@ -21,6 +21,7 @@ export class SettlementService {
     @InjectRepository(Enterprise) private enterprises: Repository<Enterprise>,
     @InjectRepository(Appeal) private appeals: Repository<Appeal>,
     @InjectRepository(User) private users: Repository<User>,
+    @InjectRepository(PositionChangeRequest) private positionChanges: Repository<PositionChangeRequest>,
     @InjectDataSource() private ds: DataSource,
   ) {}
 
@@ -71,8 +72,64 @@ export class SettlementService {
       .filter((e) => e.type === 'EXTRA_CARRY')
       .reduce((s, e) => s + (e.minutes || 0), 0);
 
+    // 临时岗位调换：以服务器时间锚点把工时单拆为「原岗位 / 争议 / 新岗位」三段
+    const pcs = await this.positionChanges.find({ where: { assignmentId } });
+    const confirmedPc = pcs
+      .filter((p) => p.status === 'CONFIRMED')
+      .sort((a, b) => (b.workerRespondedAt ? new Date(b.workerRespondedAt).getTime() : 0)
+        - (a.workerRespondedAt ? new Date(a.workerRespondedAt).getTime() : 0))[0]
+      || null;
+    // 工人拒绝且已实际到岗的到场补偿（避免事后按新岗位规则结算）
+    const appearanceCompensation = round2(
+      pcs.filter((p) => p.status === 'REJECTED' && p.appearanceCompensationRequired)
+        .reduce((sum, p) => sum + Number(p.appearanceCompensationAmount), 0),
+    );
+
+    let oldPositionPay = 0;
+    let newPositionPay = 0;
+    let disputedMinutes = 0;
+    let baseWage: number;
+
+    if (confirmedPc && checkOut) {
+      const t0 = new Date(checkIn.eventTime).getTime();
+      const t1 = new Date(checkOut.eventTime).getTime();
+      const tProp = new Date(confirmedPc.initiatedAt).getTime();
+      const tConf = confirmedPc.workerRespondedAt
+        ? new Date(confirmedPc.workerRespondedAt).getTime()
+        : tProp;
+      // 实际打卡时间轴上的三段（秒级边界裁剪到 [到岗, 签退]）
+      const segMin = (a: number, b: number) => Math.max(0,
+        Math.round((Math.min(b, t1) - Math.max(a, t0)) / 60000));
+      const oldClock = segMin(t0, tProp);
+      // 发起调换 → 工人确认之间的作业：未确认即作业，记为争议工时
+      const disputedClock = segMin(tProp, tConf);
+      const newClock = segMin(Math.max(tConf, tProp), t1);
+      const totalClock = oldClock + disputedClock + newClock;
+
+      let oldMin = 0;
+      let disputedMin = 0;
+      let newMin = 0;
+      if (totalClock > 0) {
+        oldMin = Math.floor((workMinutes * oldClock) / totalClock);
+        disputedMin = Math.floor((workMinutes * disputedClock) / totalClock);
+        newMin = Math.max(0, workMinutes - oldMin - disputedMin);
+      } else {
+        oldMin = workMinutes;
+      }
+      disputedMinutes = disputedMin;
+
+      const oldRate = Number(confirmedPc.originalDailyWage) / scheduledMinutes;
+      const newRate = Number(confirmedPc.newDailyWage) / scheduledMinutes;
+      // 争议时段暂按原岗位标准保底计发，标记争议、可经申诉裁决
+      oldPositionPay = round2((oldMin + disputedMin) * oldRate);
+      newPositionPay = round2(newMin * newRate);
+      baseWage = round2(oldPositionPay + newPositionPay);
+    } else {
+      baseWage = round2((Number(job.dailyWage) * workMinutes) / scheduledMinutes);
+      oldPositionPay = baseWage;
+    }
+
     // 金额计算
-    const baseWage = round2((Number(job.dailyWage) * workMinutes) / scheduledMinutes);
     const overtimePay = round2(overtimeMinutes * (Number(job.overtimeRate) / 60));
     const extraCarryPay = round2(
       extraCarryCount * EXTRA_CARRY_FLAT + extraCarryMinutes * (Number(job.overtimeRate) / 60) * 1.5,
@@ -83,10 +140,11 @@ export class SettlementService {
     const deductionReason = [
       lateMinutes > 0 ? `迟到 ${lateMinutes} 分钟扣款` : null,
       earlyLeaveEvent ? `早退 ${earlyLeaveEvent.minutes || 0} 分钟（已按实际工时折算）` : null,
+      disputedMinutes > 0 ? `争议工时 ${disputedMinutes} 分钟（岗位调换未确认即作业，暂按原岗位标准计发，可申诉）` : null,
     ].filter(Boolean).join('；') || null;
 
     const workerPayable = round2(
-      baseWage + overtimePay + extraCarryPay + mealAllowance - lateDeduction - otherDeduction,
+      baseWage + overtimePay + extraCarryPay + mealAllowance + appearanceCompensation - lateDeduction - otherDeduction,
     );
 
     const policy = await this.policies.findOne({ where: { assignmentId } });
@@ -110,6 +168,11 @@ export class SettlementService {
       overtimeMinutes,
       lateMinutes,
       baseWage,
+      oldPositionPay,
+      newPositionPay,
+      disputedMinutes,
+      positionChangeId: confirmedPc?.id ?? null,
+      appearanceCompensation,
       overtimePay,
       extraCarryPay,
       mealAllowance,
@@ -169,9 +232,10 @@ export class SettlementService {
   async buildEvidence(assignmentId: number) {
     const attendance = await this.attendance.find({ where: { assignmentId }, order: { eventTime: 'ASC' } });
     const events = await this.jobEvents.find({ where: { assignmentId }, order: { occurredAt: 'ASC' } });
+    const positionChanges = await this.positionChanges.find({ where: { assignmentId }, order: { id: 'ASC' } });
     const policy = await this.policies.findOne({ where: { assignmentId } });
     const settlement = await this.settlements.findOne({ where: { assignmentId } });
     const appeal = await this.appeals.findOne({ where: { assignmentId }, order: { id: 'DESC' } });
-    return { attendance, events, policy, settlement, appeal };
+    return { attendance, events, positionChanges, policy, settlement, appeal };
   }
 }

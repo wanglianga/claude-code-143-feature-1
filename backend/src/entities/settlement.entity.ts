@@ -46,6 +46,24 @@ export class Settlement {
   @Column({ type: 'decimal', precision: 10, scale: 2, default: 0 })
   extraCarryPay: number; // 已审批的额外搬运/突击任务补贴
 
+  // ---- 临时岗位调换分段工资 ----
+  @Column({ type: 'decimal', precision: 10, scale: 2, default: 0 })
+  oldPositionPay: number; // 原岗位时段工资
+
+  @Column({ type: 'decimal', precision: 10, scale: 2, default: 0 })
+  newPositionPay: number; // 工人确认调换后的新岗位时段工资
+
+  // 未确认岗位调换即开始作业的时段（争议工时，暂按原岗位标准计发，可申诉）
+  @Column({ type: 'int', default: 0 })
+  disputedMinutes: number;
+
+  @Column({ type: 'int', nullable: true })
+  positionChangeId: number | null;
+
+  // 工人拒绝临时调换且已实际到岗：企业仍须支付的到场补偿
+  @Column({ type: 'decimal', precision: 10, scale: 2, default: 0 })
+  appearanceCompensation: number;
+
   @Column({ type: 'decimal', precision: 10, scale: 2, default: 0 })
   mealAllowance: number;
 

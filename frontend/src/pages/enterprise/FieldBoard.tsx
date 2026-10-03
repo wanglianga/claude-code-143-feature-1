@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { get, post } from '../../api';
-import { Alert, Badge, EventTypeTag, Spinner, StatusBadge, fmtDateTime } from '../../components/ui';
+import { Alert, Badge, EventTypeTag, Spinner, StatusBadge, fmtDateTime, fmtMoney } from '../../components/ui';
 
 export default function FieldBoard() {
   const [data, setData] = useState<any>(null);
@@ -81,6 +81,32 @@ export default function FieldBoard() {
             </div>
           ))}
         </div>
+      </div>
+
+      <div className="card">
+        <h2>待工人确认岗位变更（{data.pendingPositionChanges.length}）</h2>
+        {data.pendingPositionChanges.length === 0 && <div className="muted small">暂无待确认的岗位调换</div>}
+        {data.pendingPositionChanges.map((p: any) => (
+          <div key={p.id} style={{ padding: '10px 0', borderBottom: '1px solid var(--line)' }}>
+            <div className="row">
+              <Badge tone="orange">待工人确认</Badge>
+              <b>{p.workerName}</b>
+              <Badge tone="blue">{p.jobTitle}</Badge>
+              <div className="spacer" />
+              <span className="small muted">发起于 {fmtDateTime(p.initiatedAt)}</span>
+            </div>
+            <div className="small" style={{ margin: '4px 0' }}>
+              调至：{p.newPosition} · 强度 L{p.intensityLevel} · 风险 L{p.newRiskLevel} ·
+              工资 {fmtMoney(p.originalDailyWage)} → {fmtMoney(p.newDailyWage)}
+            </div>
+            <div className="small" style={{ color: 'var(--orange)' }}>
+              工人确认前不得安排其从事新岗位，否则该时段记为争议工时。
+            </div>
+            <div className="row">
+              <Link className="btn btn-sm" to={`/room/${p.assignmentId}`}>进入任务室跟进</Link>
+            </div>
+          </div>
+        ))}
       </div>
 
       <div className="card">

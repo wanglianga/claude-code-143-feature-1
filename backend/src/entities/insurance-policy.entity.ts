@@ -57,6 +57,17 @@ export class InsurancePolicy {
   @Column({ type: 'boolean', default: false })
   enterpriseConfirmed: boolean;
 
+  // 临时岗位调换确认后同步更新保险范围（原方案留痕，禁止以原岗位范围结算新岗位风险）
+  @Column({ type: 'int', nullable: true })
+  adjustedByPositionChangeId: number | null;
+
+  @Column({ type: 'datetime', nullable: true })
+  adjustedAt: Date | null;
+
+  // 历次调整的人类可读留痕（产品/保额/保费/风险等级）
+  @Column({ type: 'text', nullable: true })
+  adjustmentLog: string | null;
+
   @CreateDateColumn()
   createdAt: Date;
 }

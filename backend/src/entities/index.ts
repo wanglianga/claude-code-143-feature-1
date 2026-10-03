@@ -10,3 +10,4 @@ export { ChatMessage } from './chat-message.entity';
 export { Settlement } from './settlement.entity';
 export { Appeal } from './appeal.entity';
 export { Review } from './review.entity';
+export { PositionChangeRequest } from './position-change.entity';

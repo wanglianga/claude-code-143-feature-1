@@ -3,10 +3,10 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { Repository, In } from 'typeorm';
 import {
   User, Enterprise, Job, Assignment, AttendanceEvent, InsurancePolicy,
-  JobEvent, InjuryClaim, ChatMessage, Settlement,
+  JobEvent, InjuryClaim, ChatMessage, Settlement, PositionChangeRequest,
 } from '../../entities';
-import { INDUSTRIES } from '../../risk.constants';
-import { haversineMeters } from '../../geo';
+import { INDUSTRIES, IndustryKey } from '../../risk.constants';
+import { haversineMeters, round2 } from '../../geo';
 import { verifyQrToken } from '../../qrcode';
 import { config } from '../../config';
 import { SettlementService } from '../settlements/settlement.service';
@@ -43,6 +43,7 @@ export class TasksService {
     @InjectRepository(InjuryClaim) private claims: Repository<InjuryClaim>,
     @InjectRepository(ChatMessage) private messages: Repository<ChatMessage>,
     @InjectRepository(Settlement) private settlements: Repository<Settlement>,
+    @InjectRepository(PositionChangeRequest) private positionChanges: Repository<PositionChangeRequest>,
     private settlementService: SettlementService,
     private entService: EnterpriseService,
   ) {}
@@ -59,6 +60,9 @@ export class TasksService {
     const att = await this.attendance.find({ where: { assignmentId }, order: { eventTime: 'ASC' } });
     const policy = await this.policies.findOne({ where: { assignmentId } });
     const events = await this.jobEvents.find({ where: { assignmentId }, order: { occurredAt: 'DESC' } });
+    const positionChanges = await this.positionChanges.find({
+      where: { assignmentId }, order: { id: 'DESC' },
+    });
     const claim = await this.claims.findOne({ where: { assignmentId }, order: { id: 'DESC' } });
     const msgs = await this.messages.find({ where: { assignmentId }, order: { id: 'ASC' }, take: 200 });
     const settlement = await this.settlements.findOne({ where: { assignmentId } });
@@ -77,6 +81,9 @@ export class TasksService {
       pendingCheckIn: att.find((a) => a.kind === 'CHECK_IN' && !a.allPassed && a.locationPassed && a.facePassed && a.qrcodePassed) || null,
       policy,
       events,
+      positionChanges,
+      activePositionChange: positionChanges.find((p) => p.status === 'PROPOSED') || null,
+      confirmedPositionChange: positionChanges.find((p) => p.status === 'CONFIRMED') || null,
       claim,
       messages: msgs,
       settlement,
@@ -420,6 +427,219 @@ export class TasksService {
     return { event, claim, settlement };
   }
 
+  // ===================== 到场后临时岗位调换确认 =====================
+
+  /** 依据新岗位行业/强度计算新风险等级与保险方案（后端计算，前端不可篡改） */
+  private computeNewTerms(job: Job, ent: Enterprise, dto: {
+    newIndustryKey?: string | null; intensityLevel: number; newDailyWage: number;
+  }) {
+    const industryKey = (dto.newIndustryKey && INDUSTRIES[dto.newIndustryKey as IndustryKey]
+      ? dto.newIndustryKey
+      : job.industry) as IndustryKey;
+    const industry = INDUSTRIES[industryKey];
+    let newRiskLevel = Math.min(5, industry.baseRiskLevel + Math.max(0, (ent?.riskLevel ?? 1) - 1));
+    // 新岗位强度 4 级及以上，风险等级在行业基准上再上浮一级
+    if ((dto.intensityLevel || 0) >= 4) newRiskLevel = Math.min(5, newRiskLevel + 1);
+    const coverageByRisk = [30, 30, 30, 40, 50];
+    const newCoverageWan = Math.max(job.insuranceCoverageWan, coverageByRisk[newRiskLevel - 1] || 30);
+    const newPremium = round2(Number(dto.newDailyWage) * industry.insuranceRate);
+    const newInsurerProduct = INSURER_PRODUCTS[industryKey] || '雇主责任险';
+    return { industryKey, industry, newRiskLevel, newCoverageWan, newPremium, newInsurerProduct };
+  }
+
+  /** 现场主管发起临时岗位调换（须说明新工作强度/风险/工资差异） */
+  async proposePositionChange(user: { sub: number; role: string; enterpriseId?: number | null }, dto: {
+    assignmentId: number; newPosition: string; newIndustryKey?: string | null;
+    intensityLevel: number; intensityNote: string; riskNote: string; newDailyWage: number;
+  }) {
+    const assignment = await this.assignments.findOne({ where: { id: dto.assignmentId } });
+    if (!assignment) throw new NotFoundException('派单不存在');
+    const job = await this.jobs.findOne({ where: { id: assignment.jobId } });
+    if (!job) throw new NotFoundException('岗位不存在');
+    if (user.enterpriseId !== job.enterpriseId) throw new ForbiddenException('只能对本企业岗位发起调换');
+    if (!['WORKING', 'CHECKED_IN'].includes(assignment.status)) {
+      throw new BadRequestException('工人实际到岗后才能发起临时岗位调换');
+    }
+    const open = await this.positionChanges.findOne({
+      where: [{ assignmentId: assignment.id, status: 'PROPOSED' as const },
+        { assignmentId: assignment.id, status: 'CONFIRMED' as const }],
+    });
+    if (open) {
+      throw new BadRequestException(open.status === 'CONFIRMED'
+        ? '该任务已有经工人确认的岗位调换，不能重复发起'
+        : '已发起岗位调换，正在等待工人确认');
+    }
+    if (!dto.newPosition?.trim()) throw new BadRequestException('请填写调换后的新岗位');
+    const intensity = Math.min(5, Math.max(1, Number(dto.intensityLevel) || 1));
+    const newDailyWage = round2(Number(dto.newDailyWage));
+    if (!(newDailyWage > 0)) throw new BadRequestException('请填写新岗位日结工资');
+    if (!dto.intensityNote?.trim()) throw new BadRequestException('请说明新工作强度');
+    if (!dto.riskNote?.trim()) throw new BadRequestException('请说明新岗位风险与防护');
+
+    const ent = await this.enterprises.findOne({ where: { id: job.enterpriseId } });
+    const terms = this.computeNewTerms(job, ent!, { ...dto, intensityLevel: intensity });
+    const policy = await this.policies.findOne({ where: { assignmentId: assignment.id } });
+    const originalDailyWage = Number(job.dailyWage);
+    const now = new Date();
+
+    // 同步生成一条岗位调换作业事件，进入任务时间线/证据链
+    const jobEvent = await this.jobEvents.save(this.jobEvents.create({
+      assignmentId: assignment.id,
+      jobId: job.id,
+      workerId: assignment.workerId,
+      type: 'POSITION_CHANGE',
+      newPosition: dto.newPosition.trim(),
+      description: `现场主管发起临时调换：${job.title} → ${dto.newPosition.trim()}；`
+        + `强度 L${intensity}（${dto.intensityNote.trim()}）；风险 L${terms.newRiskLevel}（${dto.riskNote.trim()}）；`
+        + `工资 ¥${originalDailyWage} → ¥${newDailyWage}（差额 ${newDailyWage - originalDailyWage >= 0 ? '+' : ''}${round2(newDailyWage - originalDailyWage)}）。等待工人确认。`,
+      occurredAt: now,
+      status: 'PENDING',
+    }));
+
+    const req = await this.positionChanges.save(this.positionChanges.create({
+      assignmentId: assignment.id,
+      jobId: job.id,
+      workerId: assignment.workerId,
+      enterpriseId: job.enterpriseId,
+      initiatedBy: user.sub,
+      initiatedAt: now,
+      newPosition: dto.newPosition.trim(),
+      newIndustryKey: terms.industryKey === job.industry ? null : terms.industryKey,
+      intensityLevel: intensity,
+      intensityNote: dto.intensityNote.trim(),
+      newRiskLevel: terms.newRiskLevel,
+      riskNote: dto.riskNote.trim(),
+      originalDailyWage,
+      newDailyWage,
+      wageDiff: round2(newDailyWage - originalDailyWage),
+      newInsurerProduct: terms.newInsurerProduct,
+      newCoverageWan: terms.newCoverageWan,
+      newPremium: terms.newPremium,
+      originalCoverageWan: policy?.coverageWan ?? job.insuranceCoverageWan,
+      originalRiskLevel: policy?.jobRiskLevel ?? terms.newRiskLevel,
+      status: 'PROPOSED',
+      jobEventId: jobEvent.id,
+    }));
+
+    await this.messages.save(this.messages.create({
+      assignmentId: assignment.id, senderId: user.sub,
+      senderName: '现场主管', senderRole: user.role,
+      content: `【岗位调换待确认】企业要求将岗位由「${job.title}」临时调换为「${req.newPosition}」：`
+        + `强度 L${req.intensityLevel}、风险 L${req.newRiskLevel}、日结工资 ¥${originalDailyWage} → ¥${req.newDailyWage}。`
+        + `请工人在任务室查看差异并确认；未确认即开始新岗位作业的时段将记为争议工时。`,
+    }));
+
+    return { request: req, message: '岗位调换申请已发起，等待工人确认（保险与工时暂不变更）' };
+  }
+
+  /** 工人确认/拒绝岗位调换 */
+  async respondPositionChange(workerId: number, id: number, accept: boolean, note?: string) {
+    const req = await this.positionChanges.findOne({ where: { id } });
+    if (!req) throw new NotFoundException('岗位调换申请不存在');
+    if (req.workerId !== workerId) throw new ForbiddenException('该调换申请不属于当前工人');
+    if (req.status !== 'PROPOSED') throw new BadRequestException('该岗位调换申请已处理');
+    if (!note?.trim()) {
+      throw new BadRequestException(accept ? '请确认知悉新岗位强度/风险/工资差异' : '请填写拒绝原因');
+    }
+
+    const now = new Date();
+    req.workerRespondedAt = now;
+    req.workerResponseNote = note.trim();
+
+    const arrivedEvent = await this.attendance.findOne({
+      where: { assignmentId: req.assignmentId, kind: 'CHECK_IN', allPassed: true },
+    });
+    req.workerArrived = !!arrivedEvent;
+
+    const jobEvent = req.jobEventId
+      ? await this.jobEvents.findOne({ where: { id: req.jobEventId } })
+      : null;
+
+    let settlement: Settlement | null = null;
+
+    if (!accept) {
+      // ---- 工人拒绝：记录原因，平台判定企业是否仍需支付到场补偿 ----
+      req.status = 'REJECTED';
+      const materialChange = Number(req.wageDiff) < 0 ||
+        req.intensityLevel >= 4 ||
+        req.newRiskLevel > req.originalRiskLevel ||
+        !!req.newIndustryKey;
+      const needComp = req.workerArrived && materialChange;
+      req.appearanceCompensationRequired = needComp;
+      if (needComp) {
+        // 到场空跑补偿：按原岗位日结工资 20%（企业到场后改变约定岗位所致）
+        req.appearanceCompensationAmount = round2(Number(req.originalDailyWage) * 0.2);
+        req.appearanceCompensationNote = '工人已实际到岗（四重校验通过），企业到场后要求调换为降薪/更高强度或更高风险岗位，'
+          + `按原岗位日结工资 20% 支付到场补偿 ¥${req.appearanceCompensationAmount}；拒绝后不得按新岗位规则结算。`;
+      } else if (!req.workerArrived) {
+        req.appearanceCompensationNote = '工人尚未完成到岗校验，不产生到场补偿。';
+      } else {
+        req.appearanceCompensationNote = '新岗位工资不低于原岗位且强度/风险未实质提高，工人拒绝调换，无需到场补偿。';
+      }
+      await this.positionChanges.save(req);
+      if (jobEvent) {
+        jobEvent.status = 'REJECTED';
+        jobEvent.reviewedBy = workerId;
+        jobEvent.reviewedAt = now;
+        jobEvent.reviewNote = `工人拒绝：${note.trim()}。${req.appearanceCompensationNote}`;
+        await this.jobEvents.save(jobEvent);
+      }
+      await this.messages.save(this.messages.create({
+        assignmentId: req.assignmentId, senderId: workerId,
+        senderName: '工人', senderRole: 'WORKER',
+        content: `【工人拒绝岗位调换】原因：${note.trim()}。`
+          + (needComp
+            ? `平台判定企业需支付到场补偿 ¥${req.appearanceCompensationAmount}，后续不得按新岗位规则结算。`
+            : `平台判定${req.appearanceCompensationNote}`),
+      }));
+      const existing = await this.settlements.findOne({ where: { assignmentId: req.assignmentId } });
+      if (existing) settlement = await this.settlementService.generate(req.assignmentId);
+      return { request: req, settlement, message: needComp
+        ? `已记录拒绝原因，平台判定企业须支付到场补偿 ¥${req.appearanceCompensationAmount}`
+        : '已记录拒绝原因，平台判定无需到场补偿' };
+    }
+
+    // ---- 工人确认：保险范围 / 工时单 / 工资同步更新 ----
+    req.status = 'CONFIRMED';
+    await this.positionChanges.save(req);
+
+    const policy = await this.policies.findOne({ where: { assignmentId: req.assignmentId } });
+    if (policy) {
+      const logLine = `${now.toLocaleString('zh-CN')} 经工人确认调换至「${req.newPosition}」：`
+        + `${policy.insurerProduct}/${policy.coverageWan}万/L${policy.jobRiskLevel}/保费¥${policy.premium}`
+        + ` → ${req.newInsurerProduct}/${req.newCoverageWan}万/L${req.newRiskLevel}/保费¥${req.newPremium}`;
+      policy.insurerProduct = req.newInsurerProduct;
+      policy.coverageWan = req.newCoverageWan;
+      policy.premium = req.newPremium;
+      policy.jobRiskLevel = req.newRiskLevel;
+      policy.adjustedByPositionChangeId = req.id;
+      policy.adjustedAt = now;
+      policy.adjustmentLog = policy.adjustmentLog ? `${policy.adjustmentLog}\n${logLine}` : logLine;
+      await this.policies.save(policy);
+    }
+    if (jobEvent) {
+      jobEvent.status = 'APPROVED';
+      jobEvent.reviewedBy = workerId;
+      jobEvent.reviewedAt = now;
+      jobEvent.reviewNote = `工人确认接受：${note.trim()}。保险范围/工时单/工资已同步更新。`;
+      await this.jobEvents.save(jobEvent);
+    }
+    await this.messages.save(this.messages.create({
+      assignmentId: req.assignmentId, senderId: workerId,
+      senderName: '工人', senderRole: 'WORKER',
+      content: `【工人确认岗位调换】接受调至「${req.newPosition}」：新日结工资 ¥${req.newDailyWage}，`
+        + `保险已同步为 ${req.newInsurerProduct}（保额 ${req.newCoverageWan} 万，风险 L${req.newRiskLevel}）。`
+        + `发起后至确认前的作业时段按争议工时单列。`,
+    }));
+    const existing = await this.settlements.findOne({ where: { assignmentId: req.assignmentId } });
+    if (existing) settlement = await this.settlementService.generate(req.assignmentId);
+
+    return {
+      request: req, insurancePolicy: policy, settlement,
+      message: `工人已确认调换：日结工资更新为 ¥${req.newDailyWage}，保险范围已同步为 ${req.newCoverageWan} 万/L${req.newRiskLevel}`,
+    };
+  }
+
   // ===================== 聊天（证据链一部分） =====================
   async postMessage(user: { sub: number; role: string; name: string; enterpriseId?: number | null }, assignmentId: number, content: string) {
     const assignment = await this.assignments.findOne({ where: { id: assignmentId } });
@@ -479,7 +699,24 @@ export class TasksService {
       }
     }
 
-    return { pendingAttendance, recentAttendance: recentAttendance.slice(0, 20), pendingEvents, jobs };
+    const pendingPositionChanges: any[] = [];
+    if (jobIds.length) {
+      const pcs = await this.positionChanges.find({
+        where: { jobId: In(jobIds), status: 'PROPOSED' },
+        order: { initiatedAt: 'DESC' },
+        take: 100,
+      });
+      for (const pc of pcs) {
+        const w = await this.users.findOne({ where: { id: pc.workerId } });
+        pendingPositionChanges.push({
+          ...pc,
+          workerName: w?.name || `#${pc.workerId}`,
+          jobTitle: jobMap.get(pc.jobId)?.title,
+        });
+      }
+    }
+
+    return { pendingAttendance, recentAttendance: recentAttendance.slice(0, 20), pendingEvents, pendingPositionChanges, jobs };
   }
 
   // ===================== 爽约标记 =====================

@@ -4,6 +4,7 @@ import { config } from './config';
 import {
   User, Enterprise, Job, Assignment, AttendanceEvent, InsurancePolicy,
   JobEvent, InjuryClaim, ChatMessage, Settlement, Appeal, Review,
+  PositionChangeRequest,
 } from './entities';
 import { INDUSTRIES, depositMultiplier, strictConfirmationRequired } from './risk.constants';
 
@@ -21,6 +22,7 @@ async function dataSource(): Promise<DataSource> {
     entities: [
       User, Enterprise, Job, Assignment, AttendanceEvent, InsurancePolicy,
       JobEvent, InjuryClaim, ChatMessage, Settlement, Appeal, Review,
+      PositionChangeRequest,
     ],
     charset: 'utf8mb4',
     timezone: '+08:00',

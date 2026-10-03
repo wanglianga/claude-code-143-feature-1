@@ -101,6 +101,31 @@ export default function AppealDesk() {
             </div>
           ))}
           {d.events.length === 0 && <div className="muted small">无作业事件</div>}
+
+          <h2 style={{ marginTop: 16 }}>岗位调换确认</h2>
+          {(d.positionChanges || []).map((p: any) => (
+            <div key={p.id} className="alert" style={{ marginBottom: 8, background: '#f7f8fa' }}>
+              <div className="row">
+                <StatusBadge status={p.status} />
+                <b>{p.newPosition}</b>
+                <span className="small muted">发起 {fmtDateTime(p.initiatedAt)}{p.workerRespondedAt ? ` · 响应 ${fmtDateTime(p.workerRespondedAt)}` : ''}</span>
+              </div>
+              <div className="small" style={{ marginTop: 4 }}>
+                强度 L{p.intensityLevel}（{p.intensityNote}）· 风险 L{p.newRiskLevel}（{p.riskNote}）<br />
+                工资 {fmtMoney(p.originalDailyWage)} → {fmtMoney(p.newDailyWage)}（差额 {fmtMoney(p.wageDiff)}）·
+                确认后保险 {p.newInsurerProduct} {p.newCoverageWan}万/L{p.newRiskLevel}/保费{fmtMoney(p.newPremium)}
+              </div>
+              {p.workerResponseNote && <div className="small muted" style={{ marginTop: 2 }}>工人意见：{p.workerResponseNote}</div>}
+              {p.status === 'REJECTED' && (
+                <div className="small" style={{ marginTop: 2, color: p.appearanceCompensationRequired ? 'var(--red)' : undefined }}>
+                  到场补偿判定：{p.appearanceCompensationRequired
+                    ? `企业须支付 ${fmtMoney(p.appearanceCompensationAmount)}` : '无需支付'}
+                  {p.appearanceCompensationNote ? `（${p.appearanceCompensationNote}）` : ''}
+                </div>
+              )}
+            </div>
+          ))}
+          {(!d.positionChanges || d.positionChanges.length === 0) && <div className="muted small">无岗位调换记录</div>}
         </div>
 
         <div>

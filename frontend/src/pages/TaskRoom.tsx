@@ -6,6 +6,7 @@ import {
   Alert, Badge, EventTypeTag, Field, Modal, Spinner, StatusBadge,
   fmtDateTime, fmtMoney,
 } from '../components/ui';
+import { INDUSTRIES } from './industry';
 
 const EVENT_TYPES = [
   { key: 'OVERTIME', label: '临时加班' },
@@ -96,6 +97,8 @@ export default function TaskRoom() {
         <>
           <InsuranceCard room={room} />
 
+          <PositionChangePanel room={room} isWorker={isWorker} isField={isField} busy={busy} onAct={act} />
+
           {isWorker && (canCheckIn || canCheckOut) && (
             <CheckInPanel
               mode={canCheckIn ? 'in' : 'out'}
@@ -176,11 +179,186 @@ function InsuranceCard({ room }: { room: any }) {
       {p && p.status !== 'ACTIVE' && p.status !== 'EXPIRED' && (
         <Alert kind="warn">保险尚未生效：未完成「定位 + 人脸 + 二维码 + 主管确认」四重到岗校验前发生事故不在保障范围，且平台禁止事后补录。</Alert>
       )}
+      {p && p.adjustedByPositionChangeId && (
+        <Alert kind="ok">
+          保险范围已随岗位调换确认同步更新（变更单 #{p.adjustedByPositionChangeId}，{fmtDateTime(p.adjustedAt)}）：
+          当前 {p.insurerProduct} · 保额 {p.coverageWan} 万 · 风险 L{p.jobRiskLevel}。
+        </Alert>
+      )}
       {room.claim && (
         <Alert kind={room.claim.coveredAtOccurrence ? 'ok' : 'error'}>
           工伤理赔单：{room.claim.injuryDesc} — {room.claim.coveredAtOccurrence
             ? '事故时保险在保障期内' : '事故时保险未生效，不予赔付，且不可事后补录'}（{room.claim.status}）
         </Alert>
+      )}
+    </div>
+  );
+}
+
+/* ---------------- 临时岗位调换确认 ---------------- */
+const INTENSITY_OPTS = [
+  { v: 2, label: 'L2 轻体力（如分拣、理货）' },
+  { v: 3, label: 'L3 中等体力（如码拍、笼车）' },
+  { v: 4, label: 'L4 重体力（如整箱搬运）' },
+  { v: 5, label: 'L5 高强度负重（如重货/重物上楼）' },
+];
+
+function PositionChangePanel({ room, isWorker, isField, busy, onAct }: any) {
+  const list: any[] = room.positionChanges || [];
+  const active = room.activePositionChange;
+  const [open, setOpen] = useState(false);
+  const [form, setForm] = useState({
+    newPosition: '', newIndustryKey: '', intensityLevel: 4,
+    intensityNote: '', riskNote: '', newDailyWage: Number(room.job.dailyWage),
+  });
+  const [respNote, setRespNote] = useState('');
+  const [rejectOpen, setRejectOpen] = useState(false);
+
+  const canPropose = isField && ['WORKING', 'CHECKED_IN'].includes(room.assignment.status)
+    && !active && !room.confirmedPositionChange;
+
+  const submit = async () => {
+    const r = await onAct(() => post('/position-changes', {
+      assignmentId: room.assignment.id,
+      newPosition: form.newPosition,
+      newIndustryKey: form.newIndustryKey || null,
+      intensityLevel: Number(form.intensityLevel),
+      intensityNote: form.intensityNote,
+      riskNote: form.riskNote,
+      newDailyWage: Number(form.newDailyWage),
+    }));
+    if (r?.request) setOpen(false);
+    return r;
+  };
+
+  return (
+    <div className="card">
+      <div className="row">
+        <h2 style={{ margin: 0 }}>到场岗位调换确认</h2>
+        <div className="spacer" />
+        {canPropose && <button className="btn btn-primary btn-sm" onClick={() => setOpen(true)}>现场主管发起岗位变更</button>}
+      </div>
+      <div className="small muted" style={{ marginTop: 6 }}>
+        到场后企业要求改做其他岗位时，须由现场主管发起并说明新工作强度、风险与工资差异，
+        经工人确认后保险范围与工时单才会同步更新；工人未确认即开始新岗位作业的时段记为争议工时。
+      </div>
+
+      {active && (
+        <div className="alert alert-warn" style={{ marginTop: 10 }}>
+          <div className="row">
+            <Badge tone="orange">待工人确认</Badge>
+            <b>{active.newPosition}</b>
+            <span className="small muted">发起于 {fmtDateTime(active.initiatedAt)}</span>
+          </div>
+          <div className="grid grid-2" style={{ marginTop: 8 }}>
+            <div className="kv">
+              <span className="k">工作强度</span><span><Badge tone={active.intensityLevel >= 4 ? 'red' : 'orange'}>L{active.intensityLevel}</Badge> {active.intensityNote}</span>
+              <span className="k">岗位风险</span><span><Badge tone={active.newRiskLevel >= 4 ? 'red' : 'orange'}>L{active.newRiskLevel}</Badge> {active.riskNote}</span>
+            </div>
+            <div className="kv">
+              <span className="k">日结工资</span>
+              <span className="money">{fmtMoney(active.originalDailyWage)} → <b>{fmtMoney(active.newDailyWage)}</b>
+                {' '}<Badge tone={Number(active.wageDiff) >= 0 ? 'green' : 'red'}>{Number(active.wageDiff) >= 0 ? '+' : ''}{fmtMoney(active.wageDiff)}</Badge></span>
+              <span className="k">确认后保险</span><span>{active.newInsurerProduct} · 保额 {active.newCoverageWan} 万 · 保费 {fmtMoney(active.newPremium)}</span>
+            </div>
+          </div>
+          {isWorker && room.assignment.status === 'WORKING' && (
+            <Alert kind="warn">⚠️ 你尚未确认该调换。在确认前已开始新岗位作业的时段将被标记为争议工时，请尽快确认或拒绝。</Alert>
+          )}
+          {isWorker && (
+            <>
+              <Field label="确认/拒绝说明（必填）">
+                <input className="input" value={respNote} onChange={(e) => setRespNote(e.target.value)}
+                  placeholder="确认时填写知悉声明；拒绝时填写拒绝原因" />
+              </Field>
+              <div className="row">
+                <button className="btn btn-success btn-sm" disabled={busy || !respNote.trim()}
+                  onClick={() => onAct(() => post(`/position-changes/${active.id}/respond`, { accept: true, note: respNote }), '已确认，保险与工时单已同步更新')}>
+                  我已知悉并确认接受
+                </button>
+                <button className="btn btn-danger btn-sm" disabled={busy || !respNote.trim()}
+                  onClick={() => setRejectOpen(true)}>拒绝调换</button>
+              </div>
+            </>
+          )}
+          {isField && <div className="small muted">已发起，等待工人在工人端确认或拒绝。</div>}
+        </div>
+      )}
+
+      {rejectOpen && active && (
+        <Modal title="拒绝岗位调换" onClose={() => setRejectOpen(false)}
+          footer={<button className="btn btn-danger" disabled={busy}
+            onClick={async () => {
+              const r = await onAct(() => post(`/position-changes/${active.id}/respond`, { accept: false, note: respNote }));
+              if (r?.request) setRejectOpen(false);
+              return r;
+            }}>确认拒绝并提交原因</button>}>
+          <Alert kind="warn">拒绝原因：{respNote || '（请在上方填写）'}</Alert>
+          <div className="small muted">
+            平台将据此判定企业是否仍需支付到场补偿：若你已实际到岗且新岗位降薪、强度/风险实质提高，企业须按原岗位日结工资 20% 支付到场补偿；拒绝后不会按新岗位规则结算。
+          </div>
+        </Modal>
+      )}
+
+      {list.filter((p) => p.status !== 'PROPOSED').map((p) => (
+        <div key={p.id} className="alert alert-info" style={{ marginTop: 8 }}>
+          <div className="row">
+            <StatusBadge status={p.status} />
+            <b>{p.newPosition}</b>
+            <span className="small muted">{fmtDateTime(p.workerRespondedAt || p.initiatedAt)}</span>
+          </div>
+          <div className="small" style={{ marginTop: 4 }}>
+            强度 L{p.intensityLevel} · 风险 L{p.newRiskLevel} · 工资 {fmtMoney(p.originalDailyWage)} → {fmtMoney(p.newDailyWage)}
+          </div>
+          {p.status === 'CONFIRMED' && (
+            <div className="small" style={{ marginTop: 4 }}>
+              ✅ 工人已确认。工资按 {fmtMoney(p.newDailyWage)} 结算，保险已同步为 {p.newInsurerProduct}（保额 {p.newCoverageWan} 万 / L{p.newRiskLevel}）。
+            </div>
+          )}
+          {p.status === 'REJECTED' && (
+            <div className="small" style={{ marginTop: 4 }}>
+              ❌ 工人拒绝原因：{p.workerResponseNote}
+              {p.appearanceCompensationRequired
+                ? <span style={{ color: 'var(--red)' }}> ｜ 平台判定企业须支付到场补偿 <b className="money">{fmtMoney(p.appearanceCompensationAmount)}</b>，不按新岗位规则结算。</span>
+                : <span className="muted"> ｜ 平台判定无需到场补偿。{p.appearanceCompensationNote}</span>}
+            </div>
+          )}
+        </div>
+      ))}
+
+      {list.length === 0 && !canPropose && <div className="muted small" style={{ marginTop: 8 }}>本次任务暂无岗位调换记录。</div>}
+
+      {open && (
+        <Modal title="现场主管发起临时岗位变更" onClose={() => setOpen(false)}
+          footer={<button className="btn btn-primary" disabled={busy} onClick={submit}>发起并通知工人确认</button>}>
+          <Alert kind="warn">请如实填写新岗位与原岗位的差异，工人确认前保险范围与工时单不变更；不得在工人未确认时安排其从事新岗位。</Alert>
+          <Field label="调换后的新岗位（如：重货搬运）">
+            <input className="input" value={form.newPosition} onChange={(e) => setForm({ ...form, newPosition: e.target.value })} />
+          </Field>
+          <Field label="新岗位行业分类（默认沿用原行业）">
+            <select className="input" value={form.newIndustryKey} onChange={(e) => setForm({ ...form, newIndustryKey: e.target.value })}>
+              <option value="">沿用原行业（{room.job.industryLabel}）</option>
+              {Object.values(INDUSTRIES).map((x: any) => <option key={x.key} value={x.key}>{x.label}</option>)}
+            </select>
+          </Field>
+          <Field label="新工作强度等级">
+            <select className="input" value={form.intensityLevel} onChange={(e) => setForm({ ...form, intensityLevel: Number(e.target.value) })}>
+              {INTENSITY_OPTS.map((o) => <option key={o.v} value={o.v}>{o.label}</option>)}
+            </select>
+          </Field>
+          <Field label="工作强度说明（负重/频次/作业方式）">
+            <textarea className="input" rows={2} value={form.intensityNote} onChange={(e) => setForm({ ...form, intensityNote: e.target.value })}
+              placeholder="如：单件 30-50kg，持续搬卸，需弯腰负重，配护腰/手套" />
+          </Field>
+          <Field label="岗位风险与防护说明">
+            <textarea className="input" rows={2} value={form.riskNote} onChange={(e) => setForm({ ...form, riskNote: e.target.value })}
+              placeholder="如：砸伤/扭伤风险升高，企业配手套护腰并安排轮换" />
+          </Field>
+          <Field label="新岗位日结工资（元/班）">
+            <input className="input" type="number" value={form.newDailyWage} onChange={(e) => setForm({ ...form, newDailyWage: Number(e.target.value) })} />
+          </Field>
+          <div className="small muted">系统将依据行业与强度自动核定新风险等级及保险保额/保费，工人确认后即时同步。</div>
+        </Modal>
       )}
     </div>
   );
@@ -439,10 +617,19 @@ function SettlementTab({ room, isWorker, isField, busy, onAct, gotoAppeal }: any
         ) : (
           <>
             {line('有效工时', `${s.workMinutes} 分钟（迟到 ${s.lateMinutes} 分钟，加班 ${s.overtimeMinutes} 分钟）`)}
+            {Number(s.disputedMinutes) > 0 && (
+              <div className="row" style={{ padding: '6px 0', borderBottom: '1px dashed var(--line)' }}>
+                <span style={{ color: 'var(--orange)' }}>争议工时（岗位调换未确认即作业）</span>
+                <div className="spacer" /><span style={{ color: 'var(--orange)' }}>{s.disputedMinutes} 分钟（暂按原岗位标准计发，可申诉）</span>
+              </div>
+            )}
             {line('基础工资', fmtMoney(s.baseWage))}
+            {Number(s.newPositionPay) > 0 && line('其中：原岗位时段工资', fmtMoney(s.oldPositionPay))}
+            {Number(s.newPositionPay) > 0 && line('其中：新岗位时段工资', `+ ${fmtMoney(s.newPositionPay)}`, 'money-green')}
             {line('加班费', `+ ${fmtMoney(s.overtimePay)}`, 'money-green')}
             {line('额外搬运补贴', `+ ${fmtMoney(s.extraCarryPay)}`, 'money-green')}
             {line('餐补', `+ ${fmtMoney(s.mealAllowance)}`, 'money-green')}
+            {Number(s.appearanceCompensation) > 0 && line('到场补偿（拒绝不合理调换）', `+ ${fmtMoney(s.appearanceCompensation)}`, 'money-green')}
             {line('迟到扣款', `- ${fmtMoney(s.lateDeduction)}`, s.lateDeduction > 0 ? '' : '')}
             {line('其他扣款', `- ${fmtMoney(s.otherDeduction)}`)}
             {s.deductionReason && <div className="small" style={{ color: 'var(--orange)' }}>扣款说明：{s.deductionReason}</div>}

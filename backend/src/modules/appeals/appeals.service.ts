@@ -3,7 +3,7 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import {
   Appeal, Assignment, Job, Enterprise, AttendanceEvent, JobEvent, ChatMessage,
-  Settlement, InsurancePolicy, InjuryClaim,
+  Settlement, InsurancePolicy, InjuryClaim, PositionChangeRequest,
 } from '../../entities';
 import { SettlementService } from '../settlements/settlement.service';
 import { EnterpriseService } from '../enterprise/enterprise.service';
@@ -20,6 +20,7 @@ export class AppealsService {
     @InjectRepository(ChatMessage) private messages: Repository<ChatMessage>,
     @InjectRepository(Settlement) private settlements: Repository<Settlement>,
     @InjectRepository(InjuryClaim) private claims: Repository<InjuryClaim>,
+    @InjectRepository(PositionChangeRequest) private positionChanges: Repository<PositionChangeRequest>,
     private settlementService: SettlementService,
     private entService: EnterpriseService,
   ) {}
@@ -79,9 +80,10 @@ export class AppealsService {
   async buildEvidence(assignmentId: number) {
     const att = await this.appeals.manager.find(AttendanceEvent, { where: { assignmentId }, order: { eventTime: 'ASC' } });
     const events = await this.jobEvents.find({ where: { assignmentId }, order: { occurredAt: 'ASC' } });
+    const positionChanges = await this.positionChanges.find({ where: { assignmentId }, order: { id: 'ASC' } });
     const msgs = await this.messages.find({ where: { assignmentId }, order: { id: 'ASC' }, take: 300 });
     const settlement = await this.settlements.findOne({ where: { assignmentId } });
-    const policy = await this.appeals.manager.findOne(InsurancePolicy, { where: { assignmentId } });
+    const pol = await this.appeals.manager.findOne(InsurancePolicy, { where: { assignmentId } });
 
     const summary = [
       `签到记录 ${att.length} 条：`,
@@ -94,12 +96,18 @@ export class AppealsService {
         `  - [${x.type}] ${new Date(x.occurredAt).toLocaleString('zh-CN')} ${x.status} ${x.description}` +
         `${x.minutes ? `(${x.minutes}分钟)` : ''}${x.photoUrl ? ' 附照片' : ''} 审核:${x.reviewNote || '-'}`,
       ),
-      `保险：${policy ? `${policy.status}，生效 ${policy.effectiveFrom ? new Date(policy.effectiveFrom).toLocaleString('zh-CN') : '未生效'}` : '无保单'}`,
-      `结算：${settlement ? `应发 ¥${settlement.workerPayable}，迟到扣款 ¥${settlement.lateDeduction}，状态 ${settlement.status}` : '未生成'}`,
+      `岗位调换 ${positionChanges.length} 条：`,
+      ...positionChanges.map((x) =>
+        `  - [${x.status}] ${new Date(x.initiatedAt).toLocaleString('zh-CN')} ${x.newPosition} ` +
+        `强度L${x.intensityLevel} 风险L${x.newRiskLevel} 工资¥${x.originalDailyWage}→¥${x.newDailyWage}` +
+        (x.workerRespondedAt ? ` 工人${new Date(x.workerRespondedAt).toLocaleString('zh-CN')}响应` : '') +
+        (x.appearanceCompensationRequired ? ` 到场补偿¥${x.appearanceCompensationAmount}` : '')),
+      `保险：${pol ? `${pol.status}，生效 ${pol.effectiveFrom ? new Date(pol.effectiveFrom).toLocaleString('zh-CN') : '未生效'}` : '无保单'}`,
+      `结算：${settlement ? `应发 ¥${settlement.workerPayable}，迟到扣款 ¥${settlement.lateDeduction}，争议工时 ${settlement.disputedMinutes} 分钟，状态 ${settlement.status}` : '未生成'}`,
       `聊天记录 ${msgs.length} 条（详见证据包）`,
     ].join('\n');
 
-    return { attendance: att, events, messages: msgs, settlement, policy, summary };
+    return { attendance: att, events, positionChanges, messages: msgs, settlement, policy: pol, summary };
   }
 
   async evidence(appealId: number) {
